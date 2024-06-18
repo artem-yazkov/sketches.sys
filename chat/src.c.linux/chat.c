@@ -43,44 +43,6 @@ typedef struct cfg_obj_s {
 } cfg_obj_t;
 typedef LIST_HEAD(cfg_objlist_s, cfg_obj_s) cfg_objlist_t;
 
-/*
- * room mates handling
- */
-static int
-roommate_create(roommate_t **roommate, cfg_obj_t *obj)
-{
-    if (!obj->name_sz || !obj->ext_sz) {
-        return -1;
-    }
-    if ((*roommate = calloc(1, sizeof(roommate_t))) == NULL) {
-        goto error;
-    }
-    if (((*roommate)->name = strndup(obj->name, obj->name_sz)) == NULL) {
-        goto error;
-    }
-    if (((*roommate)->passwd = strndup(obj->ext, obj->ext_sz)) == NULL) {
-        goto error;
-    }
-    return 0;
-
-error:
-    if (*roommate) {
-        free((*roommate)->name);
-        free((*roommate)->passwd);
-        free((*roommate));
-        *roommate = NULL;
-    }
-    return -1;
-}
-
-static void
-roommate_del(roommate_t *roommate)
-{
-    free(roommate->name);
-    free(roommate->passwd);
-    free(roommate);
-}
-
 static int
 roommates_compar(const void *mate_l, const void *mate_r)
 {
@@ -88,56 +50,110 @@ roommates_compar(const void *mate_l, const void *mate_r)
 }
 
 static int
-roommates_add(roommates_t **roommates, cfg_objlist_t *objlist)
+rooms_compar(const void *mate_l, const void *mate_r)
 {
-    int newmates = 0;
-    cfg_obj_t *cfg_obj;
-    LIST_FOREACH(cfg_obj, objlist, lentry) {
-        if (!cfg_obj->name_sz || !cfg_obj->ext_sz) {
-            continue;
-        }
-        roommate_t *roommate;
-        if (roommate_create(&roommate, cfg_obj) >= 0) {
-            void *tmate = tsearch(roommate, roommates, roommates_compar);
-            if (!tmate) {
-                /* allocation error */
-                roommate_del(roommate);
-            } else if (*(roommate_t **)tmate != roommate) {
-                /* already exists */
-                roommate_del(roommate);
-            } else {
-                newmates++;
-            }
-        }
+    return strcmp(((room_t *)mate_l)->name, ((room_t *)mate_r)->name);
+}
+
+/***********************
+ * room mates handling
+ ***********************/
+static int
+roommate_create(roommate_t **mate, cfg_obj_t *cfgmate)
+{
+    if (!cfgmate->name_sz || !cfgmate->ext_sz) {
+        return -1;
     }
-    return newmates;
+    if ((*mate = calloc(1, sizeof(roommate_t))) == NULL) {
+        goto error;
+    }
+    if (((*mate)->name = strndup(cfgmate->name, cfgmate->name_sz)) == NULL) {
+        goto error;
+    }
+    if (((*mate)->passwd = strndup(cfgmate->ext, cfgmate->ext_sz)) == NULL) {
+        goto error;
+    }
+    return 0;
+
+error:
+    if (*mate) {
+        free((*mate)->name);
+        free((*mate)->passwd);
+        free((*mate));
+        *mate = NULL;
+    }
+    return -1;
+}
+
+static void
+roommate_del(roommate_t *mate)
+{
+    while (mate->rooms) {
+        room_t *troom = *(room_t **)(mate->rooms);
+        tdelete(mate, troom->mates, roommates_compar);
+        tdelete(troom, mate->rooms, rooms_compar);
+   }
+   free(mate->name);
+   free(mate->passwd);
+   free(mate);
 }
 
 static int
-roommates_del(roommates_t **roommates, cfg_objlist_t *objlist)
+roommates_add(roommates_t **mates, cfg_objlist_t *cfgmates)
 {
-    cfg_obj_t *cfg_obj;
-    LIST_FOREACH(cfg_obj, objlist, lentry) {
-        roommate_t roommate = {
-            .name = strndup(cfg_obj->name, cfg_obj->name_sz),
-            .passwd = strndup(cfg_obj->ext, cfg_obj->ext_sz)
-        };
-        if (roommate.name && roommate.passwd) {
-            tdelete(&roommate, roommates, roommates_compar);
+    cfg_obj_t *cmate;
+    LIST_FOREACH(cmate, cfgmates, lentry) {
+        if (!cmate->name_sz || !cmate->ext_sz) {
+            fprintf(stderr, "Room Mate name and password must be set. Ignore object '%.*s:%.*s'\n",
+                    (int)(cmate->name_sz), cmate->name,
+                    (int)(cmate->ext_sz), cmate->ext);
+            continue;
         }
-        free(roommate.name);
-        free(roommate.passwd);
+        roommate_t *roommate;
+        if (roommate_create(&roommate, cmate) >= 0) {
+            void *tmate = tsearch(roommate, mates, roommates_compar);
+            if (!tmate) {
+                /* allocation error */
+                roommate_del(roommate);
+                return -1;
+            } else if (*(roommate_t **)tmate != roommate) {
+                /* already exists */
+                //fprintf(stderr, "Room Mate %s exists. Can't create new one with same name\n");
+                roommate_del(roommate);
+            }
+        }
     }
     return 0;
 }
 
 static int
-roommates_clear(roommates_t **roommates)
+roommates_del(roommates_t **mates, cfg_objlist_t *cfgmates)
 {
-    while (*roommates) {
-        roommate_t *roommate = *(roommate_t **)(*roommates);
-        tdelete(roommate, roommates, roommates_compar);
-        roommate_del(roommate);
+    cfg_obj_t *cmate;
+    LIST_FOREACH(cmate, cfgmates, lentry) {
+        roommate_t kmate = {
+            .name = strndup(cmate->name, cmate->name_sz)
+        };
+        if (kmate.name) {
+            void *pt_mate = tfind(&kmate, mates, roommates_compar);
+            if (pt_mate) {
+                roommate_t *tmate = *(roommate_t **)pt_mate;
+                tdelete(tmate, mates, roommates_compar);
+                roommate_del(tmate);
+            }
+        }
+        free(kmate.name);
+    }
+    return 0;
+}
+
+static int
+roommates_clear(roommates_t **mates)
+{
+    while (*mates) {
+        roommate_t *tmate = *(roommate_t **)(*mates);
+        tdelete(tmate, mates, roommates_compar);
+        roommate_del(tmate);
     }
     return 0;
 }
@@ -151,42 +167,133 @@ roommates_walk(const void *ptr, VISIT order, int level)
     }
 }
 
-/*
+/******************
  * rooms handling
- */
+ ******************/
 static int
-rooms_compar(const void *mate_l, const void *mate_r)
+room_create(room_t **room, char *name, size_t name_sz)
 {
-    return strcmp(((room_t *)mate_l)->name, ((room_t *)mate_r)->name);
+    if ((*room = calloc(1, sizeof(room_t))) == NULL) {
+        goto error;
+    }
+    if (((*room)->name = strndup(name, name_sz)) == NULL) {
+        goto error;
+    }
+    return 0;
+
+error:
+    if (*room) {
+        free((*room)->name);
+        *room = NULL;
+    }
+    return -1;
+}
+
+static void
+room_del(room_t *room)
+{
+    free(room->name);
+    free(room);
 }
 
 static int
-room_add_mates(room_t *room, char *name, size_t name_sz, cfg_objlist_t *objlist)
+room_add_mates(rooms_t **rooms, roommates_t *mates, char *room_name, size_t room_name_sz, cfg_objlist_t *cfgmates)
 {
+    room_t *room;
+    if (room_create(&room, room_name, room_name_sz) < 0) {
+        fprintf(stderr, "Can't create new room '%.*s'\n", (int)room_name_sz, room_name);
+        return -1;
+    }
+    void *troom = tsearch(room, rooms, rooms_compar);
+    if (!troom) {
+        /* allocation error */
+        room_del(room);
+        return -1;
+    } else if (*(room_t **)troom != room) {
+        /* already exists */
+        room_del(room);
+        room = *(room_t **)troom;
+    }
+
+    /* add mates to the room */
+    cfg_obj_t *cmate;
+    LIST_FOREACH(cmate, cfgmates, lentry) {
+        if (cmate->name_sz == 1 && cmate->name[0] == '*') {
+            room->is_open = true;
+            continue;
+        }
+        roommate_t kmate = {
+            .name = strndup(cmate->name, cmate->name_sz)
+        };
+        if (!kmate.name) {
+            /* allocation error */
+            return -1;
+        }
+        roommate_t *tmate = tfind(&kmate, mates, roommates_compar);
+        tsearch(tmate, &room->mates, roommates_compar);
+        tsearch(room, &tmate->rooms, rooms_compar);
+        free(kmate.name);
+    }
     return 0;
 }
 
 static int
-room_del_mates(room_t *room, char *name, size_t name_sz, cfg_objlist_t *objlist)
+room_del_mates(rooms_t *rooms, char *name, size_t name_sz, cfg_objlist_t *cfgmates)
 {
+    /* find the room by name */
+    roommate_t kroom = {
+        .name = strndup(name, name_sz)
+    };
+    if (!kroom.name) {
+        /* allocation error */
+        return -1;
+    }
+    room_t *troom = tfind(&kroom, rooms, rooms_compar);
+    free(kroom.name);
+    if (!troom) {
+        /* the room does not exists */
+        return -1;
+    }
+
+    /* delete mates from the room */
+    cfg_obj_t *cmate;
+    LIST_FOREACH(cmate, cfgmates, lentry) {
+        if (cmate->name_sz == 1 && cmate->name[0] == '*') {
+            troom->is_open = false;
+            continue;
+        }
+        roommate_t kmate = {
+            .name = strndup(cmate->name, cmate->name_sz)
+        };
+        roommate_t *tmate = tfind(&kmate, troom->mates, roommates_compar);
+        if (!tmate) {
+            continue;
+        }
+        tdelete(troom, &tmate->rooms, rooms_compar);
+        tdelete(tmate, &troom->mates, roommates_compar);
+    }
     return 0;
 }
 
 static int
-room_clear_mates(room_t *room, char *name, size_t name_sz)
+room_clear_mates(room_t *room)
 {
+    while (room->mates) {
+        roommate_t *tmate = *(roommate_t **)(room->mates);
+        tdelete(room, &tmate->rooms, rooms_compar);
+        tdelete(tmate, &room->mates, roommates_compar);
+    }
     return 0;
 }
 
 static int
-room_del(room_t *room, char *name, size_t name_sz)
+rooms_clear(rooms_t **rooms)
 {
-    return 0;
-}
-
-static int
-room_clear(room_t *room)
-{
+    while (rooms) {
+        room_t *troom = *(room_t **)(*rooms);
+        tdelete(troom, rooms, rooms_compar);
+        room_del(troom);
+    }
     return 0;
 }
 
@@ -264,6 +371,7 @@ int main(int argc, char **argv)
     cfg_objlist_clear(&roommates);
 #endif
 
+#if 1
     char *rmates_cstr = "alpha:alpha,bravo:bravo,charlie:charlie";
     cfg_objlist_t rmates_clist;
 
@@ -297,6 +405,6 @@ int main(int argc, char **argv)
     roommates_clear(&roommates);
     twalk(roommates, roommates_walk);
     printf("\n");
-
+#endif
     return 0;
 }
