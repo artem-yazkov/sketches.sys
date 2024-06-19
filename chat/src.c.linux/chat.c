@@ -44,6 +44,13 @@ typedef struct cfg_obj_s {
 } cfg_obj_t;
 typedef LIST_HEAD(cfg_objlist_s, cfg_obj_s) cfg_objlist_t;
 
+typedef struct state_s {
+    bool        is_admin;
+    roommates_t *mates;
+    rooms_t     *rooms;
+    conns_t     *conns;
+} state_t;
+
 /***********************
  * comparison
  ***********************/
@@ -75,7 +82,7 @@ roommates_walk(const void *ptr, VISIT order, void *ctx)
         if ((uint64_t)ctx == STATUS_VERBOSITY_SHORT) {
             printf("%s  ", mate->name);
         } else {
-            printf("%s:%s  ", mate->name, mate->passwd);
+            printf("  * %s (%s)\n", mate->name, mate->passwd);
         }
     }
 }
@@ -88,7 +95,7 @@ rooms_walk(const void *ptr, VISIT order, void *ctx)
         if ((uint64_t)ctx == STATUS_VERBOSITY_SHORT) {
             printf("%s  ", room->name);
         } else {
-            printf("name: %s, open: %s, mates:  ", room->name, room->is_open ? "yes" : "no");
+            printf("  * name: %s, open: %s, mates:  ", room->name, room->is_open ? "yes" : "no");
             twalk_r(room->mates, roommates_walk, (void *)STATUS_VERBOSITY_SHORT);
             printf("\n");
         }
@@ -130,8 +137,8 @@ roommate_del(roommate_t *mate)
 {
     while (mate->rooms) {
         room_t *troom = *(room_t **)(mate->rooms);
-        tdelete(mate, troom->mates, roommates_compar);
-        tdelete(troom, mate->rooms, rooms_compar);
+        tdelete(mate, &troom->mates, roommates_compar);
+        tdelete(troom, &mate->rooms, rooms_compar);
    }
    free(mate->name);
    free(mate->passwd);
@@ -225,8 +232,8 @@ room_del(room_t *room)
 {
     while (room->mates) {
         roommate_t *tmate = *(roommate_t **)(room->mates);
-        tdelete(room, tmate->rooms, rooms_compar);
-        tdelete(tmate, room->mates, roommates_compar);
+        tdelete(room, &tmate->rooms, rooms_compar);
+        tdelete(tmate, &room->mates, roommates_compar);
     }
     free(room->name);
     free(room);
@@ -338,14 +345,14 @@ rooms_clear(rooms_t **rooms)
     while (*rooms) {
         room_t *troom = *(room_t **)(*rooms);
         tdelete(troom, rooms, rooms_compar);
-        //room_del(troom);
+        room_del(troom);
     }
     return 0;
 }
 
-/*
+/**************************
  * configuration handling
- */
+ **************************/
 
 #define CFG_OBJ_OUTER_DELIMS(c) (isspace(c) || c == ',' || c == ';')
 #define CFG_OBJ_INNER_DELIMS(c) (c == ':')
@@ -399,37 +406,116 @@ cfg_objlist_clear(cfg_objlist_t *objlist)
     return 0;
 }
 
+static int
+cfg_admin(char *cmdline, state_t *state, bool *quit)
+{
+    int   retcode = 0;
+    char *cmdline_sptr = NULL;
+    char *cmdline_sdup = strdup(cmdline);
+
+    char *command = !cmdline_sdup ? NULL : strtok_r(cmdline_sdup, " ", &cmdline_sptr);
+    if (!command) {
+        free(cmdline_sdup);
+        return -1;
+    }
+    if (strcmp(command, ":quit") == 0) {
+        *quit = true;
+        return 0;
+    } else {
+        *quit = false;
+    }
+
+    if (state->is_admin) {
+        if (strcmp(command, ":roommates") == 0) {
+            char *subcmd = strtok_r(NULL, " ", &cmdline_sptr);
+
+            if (subcmd && (strcmp(subcmd, "add") == 0) && cmdline_sptr) {
+                cfg_objlist_t col_mates;
+                LIST_INIT(&col_mates);
+                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+
+                if (!LIST_EMPTY(&col_mates)) {
+                    roommates_add(&state->mates, &col_mates);
+                    cfg_objlist_clear(&col_mates);
+                }
+            } else if (subcmd && (strcmp(subcmd, "del") == 0) && cmdline_sptr) {
+                cfg_objlist_t col_mates;
+                LIST_INIT(&col_mates);
+                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+
+                if (!LIST_EMPTY(&col_mates)) {
+                    roommates_del(&state->mates, &col_mates);
+                    cfg_objlist_clear(&col_mates);
+                }
+            } else if (subcmd && strcmp(subcmd, "clear") == 0) {
+                roommates_clear(&state->mates);
+
+            } else if (subcmd && strcmp(subcmd, "show") == 0) {
+                twalk_r(state->mates, roommates_walk, (void *)STATUS_VERBOSITY_LONG);
+            }
+        }
+
+        if (strcmp(command, ":rooms") == 0) {
+            char *subcmd = strtok_r(NULL, " ", &cmdline_sptr);
+
+            if (subcmd && strcmp(subcmd, "addmates") == 0) {
+                char *rname = strtok_r(NULL, " ", &cmdline_sptr);
+                if (rname && cmdline_sptr) {
+                    cfg_objlist_t col_mates;
+                    LIST_INIT(&col_mates);
+                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+
+                    if (!LIST_EMPTY(&col_mates)) {
+                        room_add_mates(&state->rooms, &state->mates, rname, strlen(rname), &col_mates);
+                        cfg_objlist_clear(&col_mates);
+                    }
+                }
+            }
+            if (subcmd && strcmp(subcmd, "delmates") == 0) {
+                char *rname = strtok_r(NULL, " ", &cmdline_sptr);
+                if (rname && cmdline_sptr) {
+                    cfg_objlist_t col_mates;
+                    LIST_INIT(&col_mates);
+                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+
+                    if (!LIST_EMPTY(&col_mates)) {
+                        room_del_mates(&state->rooms, rname, strlen(rname), &col_mates);
+                        cfg_objlist_clear(&col_mates);
+                    }
+                }
+            }
+        }
+
+        if (strcmp(command, ":status") == 0) {
+            printf("Room Mates status:\n");
+            twalk_r(state->mates, roommates_walk, (void *)STATUS_VERBOSITY_LONG);
+            printf("Rooms status:\n");
+            twalk_r(state->rooms, rooms_walk, (void *)STATUS_VERBOSITY_LONG);
+        }
+    }
+    free(cmdline_sdup);
+    return retcode;
+}
+
 int main(int argc, char **argv)
 {
-    char *rmates_cstr = "alpha:111,bravo:222,charlie:333,delta:444";
-    cfg_objlist_t rmates_clist;
+    state_t state = {.is_admin = true};
+    bool fquit = false;
 
-    LIST_INIT(&rmates_clist);
-    cfg_objstring_parse((char*)rmates_cstr, strlen(rmates_cstr), &rmates_clist, CFG_OBJ_ROOMMATES);
+    while(!fquit) {
+        char  *line = NULL;
+        size_t line_sz = 0;
+        getline(&line, &line_sz, stdin);
+        while (line && strlen(line) && line[strlen(line)-1] == '\n') {
+            line[strlen(line)-1] = '\0';
+        }
+        if (line) {
+            cfg_admin(line, &state, &fquit);
+        }
+        free(line);
+    }
+    roommates_clear(&state.mates);
+    rooms_clear(&state.rooms);
 
-    roommates_t *roommates = NULL;
-    roommates_add(&roommates, &rmates_clist);
-    cfg_objlist_clear(&rmates_clist);
-
-    rooms_t *rooms = NULL;
-
-    rmates_cstr = "alpha,bravo";
-    cfg_objstring_parse((char*)rmates_cstr, strlen(rmates_cstr), &rmates_clist, CFG_OBJ_ROOMMATES);
-    room_add_mates(&rooms, &roommates, "bedroom", strlen("bedroom"), &rmates_clist);
-    cfg_objlist_clear(&rmates_clist);
-
-    rmates_cstr = "charlie,delta,unknown,*";
-    cfg_objstring_parse((char*)rmates_cstr, strlen(rmates_cstr), &rmates_clist, CFG_OBJ_ROOMMATES);
-    room_add_mates(&rooms, &roommates, "guestroom", strlen("guestroom"), &rmates_clist);
-    cfg_objlist_clear(&rmates_clist);
-    twalk_r(rooms, rooms_walk, (void *)STATUS_VERBOSITY_LONG);
-
-    rmates_cstr = "delta,unknown,*";
-    cfg_objstring_parse((char*)rmates_cstr, strlen(rmates_cstr), &rmates_clist, CFG_OBJ_ROOMMATES);
-    room_del_mates(&rooms, "guestroom", strlen("guestroom"), &rmates_clist);
-    twalk_r(rooms, rooms_walk, (void *)STATUS_VERBOSITY_LONG);
-
-    rooms_clear(&rooms);
-    twalk_r(rooms, rooms_walk, (void *)STATUS_VERBOSITY_LONG);
     return 0;
 }
