@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,117 @@ typedef struct state_s {
 } state_t;
 
 /***********************
+ * message broker
+ ***********************/
+
+/* Message Types */
+#define MSG_TYP_CM      (0x1)   /* Client Chat Message */
+#define MSG_TYP_CC      (0x2)   /* Client Command */
+#define MSG_TYP_SC      (0x3)   /* Server Command */
+#define MSG_TYP_SI      (0x4)   /* Server Info Message */
+#define MSG_TYP_SE      (0x5)   /* Server Error Message */
+#define MSG_TYP_LI      (0x6)   /* Server Info Message, Local */
+#define MSG_TYP_LE      (0x7)   /* Server Error Message, Local */
+#define MSG_TYP_MASK(X) (X & 0x0F)
+
+/* Message broadcast width */
+#define MSG_WID_AC      (0x1 << 4)  /* to Active Connection only */
+#define MSG_WID_MT      (0x2 << 4)  /* to all Room Mate connections, except Active Connection */
+#define MSG_WID_MTA     (0x3 << 4)  /* to all Room Mate connections, including Active Connection */
+#define MSG_WID_RM      (0x4 << 4)  /* to all Room connections, except Active Connection */
+#define MSG_WID_RMA     (0x5 << 4)  /* to all Room connections, including Active Connection */
+#define MSG_WID_MASK(X) (X & 0xF0)
+
+#define MSG_NOFIN       (0x1 << 8)  /* wait next part of the message */
+
+typedef struct msg_s {
+    char   *data;
+    size_t  data_sz;
+    int     options;
+    bool    ready;
+    int     refs;
+    CIRCLEQ_ENTRY(msg_s) cq_entry;
+} msg_t;
+typedef CIRCLEQ_HEAD(msg_list_s, msg_s) msg_list_t;
+
+typedef struct msg_broker_s {
+    conn_t *active_conn;
+    msg_list_t msg_pool;
+    msg_list_t msgs_local;
+} msg_broker_t;
+
+static void
+msg_set_active_conn(msg_broker_t *broker, conn_t *conn)
+{
+    broker->active_conn = conn;
+}
+
+static int
+msg_add(msg_broker_t *broker, int options, const char * format, ... )
+{
+    /* add new message to the list, or update data on last message */
+    msg_t *msg = NULL;
+    if (CIRCLEQ_EMPTY(&broker->msg_pool) || CIRCLEQ_LAST(&broker->msg_pool)->ready) {
+        msg = calloc(1, sizeof(msg_t));
+        if (!(msg = calloc(1, sizeof(msg_t)))) {
+            goto error;
+        }
+        CIRCLEQ_INSERT_TAIL(&broker->msg_pool, msg, cq_entry);
+    } else {
+        msg = CIRCLEQ_LAST(&broker->msg_pool);
+    }
+    va_list args;
+    va_start(args, format);
+    char *chunk = NULL;
+    int   chunk_sz = vsnprintf (NULL, 0, format, args);
+    va_end(args);
+    if (chunk_sz < 0) {
+        goto error;
+    }
+    if (!(chunk = realloc(msg->data, msg->data_sz + chunk_sz + 1))) {
+        goto error;
+    }
+    msg->data = chunk;
+    va_start(args, format);
+    vsnprintf (&msg->data[msg->data_sz], chunk_sz + 1, format, args);
+    va_end(args);
+    msg->data_sz += chunk_sz;
+
+    msg->options = options;
+    if (!(msg->options & MSG_NOFIN)) {
+        msg->ready = 1;
+
+        /* create appropriate references */
+        if (!broker->active_conn ||
+            (MSG_TYP_MASK(msg->options) == MSG_TYP_LE) || (MSG_TYP_MASK(msg->options) == MSG_TYP_LI)
+            ) {
+            CIRCLEQ_INSERT_TAIL(&broker->msgs_local, msg, cq_entry);
+        }
+    }
+    return 0;
+
+error:
+    if (msg) {
+        CIRCLEQ_REMOVE(&broker->msg_pool, msg, cq_entry);
+        free(msg->data);
+        free(msg);
+    }
+    return -1;
+}
+
+static void
+msg_flush_local(msg_broker_t *broker)
+{
+    msg_t *mfirst = CIRCLEQ_FIRST(&broker->msgs_local);
+    for (; mfirst != (void *)&broker->msgs_local; ) {
+        fprintf(stdout, "message: '%.*s'\n", (int)mfirst->data_sz, mfirst->data);
+        msg_t *mnext = CIRCLEQ_NEXT(mfirst, cq_entry);
+        free(mfirst);
+        mfirst = mnext;
+    }
+}
+
+/***********************
  * comparison
  ***********************/
 static int
@@ -67,7 +179,7 @@ rooms_compar(const void *mate_l, const void *mate_r)
 }
 
 /***********************
- * walk
+ * status routines
  ***********************/
 typedef enum status_verbosity_e {
     STATUS_VERBOSITY_SHORT,
@@ -75,7 +187,7 @@ typedef enum status_verbosity_e {
 } status_verbosity_t;
 
 static void
-roommates_walk(const void *ptr, VISIT order, void *ctx)
+roommates_status(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
         roommate_t *mate = *(roommate_t **) ptr;
@@ -88,7 +200,7 @@ roommates_walk(const void *ptr, VISIT order, void *ctx)
 }
 
 static void
-rooms_walk(const void *ptr, VISIT order, void *ctx)
+rooms_status(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
         room_t *room = *(room_t **) ptr;
@@ -96,7 +208,7 @@ rooms_walk(const void *ptr, VISIT order, void *ctx)
             printf("%s  ", room->name);
         } else {
             printf("  * name: %s, open: %s, mates:  ", room->name, room->is_open ? "yes" : "no");
-            twalk_r(room->mates, roommates_walk, (void *)STATUS_VERBOSITY_SHORT);
+            twalk_r(room->mates, roommates_status, (void *)STATUS_VERBOSITY_SHORT);
             printf("\n");
         }
     }
@@ -451,7 +563,7 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
                 roommates_clear(&state->mates);
 
             } else if (subcmd && strcmp(subcmd, "show") == 0) {
-                twalk_r(state->mates, roommates_walk, (void *)STATUS_VERBOSITY_LONG);
+                twalk_r(state->mates, roommates_status, (void *)STATUS_VERBOSITY_LONG);
             }
         }
 
@@ -488,9 +600,9 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
 
         if (strcmp(command, ":status") == 0) {
             printf("Room Mates status:\n");
-            twalk_r(state->mates, roommates_walk, (void *)STATUS_VERBOSITY_LONG);
+            twalk_r(state->mates, roommates_status, (void *)STATUS_VERBOSITY_LONG);
             printf("Rooms status:\n");
-            twalk_r(state->rooms, rooms_walk, (void *)STATUS_VERBOSITY_LONG);
+            twalk_r(state->rooms, rooms_status, (void *)STATUS_VERBOSITY_LONG);
         }
     }
     free(cmdline_sdup);
@@ -499,6 +611,7 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
 
 int main(int argc, char **argv)
 {
+#if 0
     state_t state = {.is_admin = true};
     bool fquit = false;
 
@@ -516,6 +629,16 @@ int main(int argc, char **argv)
     }
     roommates_clear(&state.mates);
     rooms_clear(&state.rooms);
+#endif
+
+    msg_broker_t broker = {0};
+    CIRCLEQ_INIT(&broker.msg_pool);
+    CIRCLEQ_INIT(&broker.msgs_local);
+    msg_add(&broker, MSG_TYP_CC | MSG_NOFIN, "Hello");
+    msg_add(&broker, MSG_TYP_CC | MSG_NOFIN, ", World");
+    msg_add(&broker, MSG_TYP_CC, "!");
+    msg_add(&broker, MSG_TYP_CC, "Hello, World!");
+    msg_flush_local(&broker);
 
     return 0;
 }
