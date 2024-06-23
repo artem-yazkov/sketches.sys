@@ -1,96 +1,8 @@
-#include <ctype.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <search.h>
-#include <sys/queue.h>
+#include "chat.h"
 
-typedef void roommates_t;
-typedef void rooms_t;
-typedef void conns_t;
-
-typedef struct roommate_s {
-    char        *name;
-    char        *passwd;
-    rooms_t     *rooms;
-    conns_t     *conns;
-} roommate_t;
-
-typedef struct room_s {
-    char        *name;
-    bool         is_open;
-    roommates_t *mates;
-    conns_t     *conns;
-} room_t;
-
-typedef struct conn_s {
-    roommate_t *roommate;
-    room_t     *room;
-} conn_t;
-
-typedef enum cfg_objtype_e {
-    CFG_OBJ_ROOMS,
-    CFG_OBJ_ROOMMATES
-} cfg_objtype_t;
-
-typedef struct cfg_obj_s {
-    char   *name;
-    size_t  name_sz;
-    char   *ext;
-    size_t  ext_sz;
-    LIST_ENTRY(cfg_obj_s) lentry;
-} cfg_obj_t;
-typedef LIST_HEAD(cfg_objlist_s, cfg_obj_s) cfg_objlist_t;
-
-typedef struct state_s {
-    bool        is_admin;
-    roommates_t *mates;
-    rooms_t     *rooms;
-    conns_t     *conns;
-} state_t;
-
-/***********************
- * message broker
- ***********************/
-
-/* Message Types */
-#define MSG_TYP_CM      (0x1)   /* Client Chat Message */
-#define MSG_TYP_CC      (0x2)   /* Client Command */
-#define MSG_TYP_SC      (0x3)   /* Server Command */
-#define MSG_TYP_SI      (0x4)   /* Server Info Message */
-#define MSG_TYP_SE      (0x5)   /* Server Error Message */
-#define MSG_TYP_LI      (0x6)   /* Server Info Message, Local */
-#define MSG_TYP_LE      (0x7)   /* Server Error Message, Local */
-#define MSG_TYP_MASK(X) (X & 0x0F)
-
-/* Message broadcast width */
-#define MSG_WID_AC      (0x1 << 4)  /* to Active Connection only */
-#define MSG_WID_MT      (0x2 << 4)  /* to all Room Mate connections, except Active Connection */
-#define MSG_WID_MTA     (0x3 << 4)  /* to all Room Mate connections, including Active Connection */
-#define MSG_WID_RM      (0x4 << 4)  /* to all Room connections, except Active Connection */
-#define MSG_WID_RMA     (0x5 << 4)  /* to all Room connections, including Active Connection */
-#define MSG_WID_MASK(X) (X & 0xF0)
-
-#define MSG_NOFIN       (0x1 << 8)  /* wait next part of the message */
-
-typedef struct msg_s {
-    char   *data;
-    size_t  data_sz;
-    int     options;
-    bool    ready;
-    int     refs;
-    CIRCLEQ_ENTRY(msg_s) cq_entry;
-} msg_t;
-typedef CIRCLEQ_HEAD(msg_list_s, msg_s) msg_list_t;
-
-typedef struct msg_broker_s {
-    conn_t *active_conn;
-    msg_list_t msg_pool;
-    msg_list_t msgs_local;
-} msg_broker_t;
+/***********************************************
+ * IMPLEMENTATION
+ ***********************************************/
 
 static void
 msg_set_active_conn(msg_broker_t *broker, conn_t *conn)
@@ -465,9 +377,6 @@ rooms_clear(rooms_t **rooms)
 /**************************
  * configuration handling
  **************************/
-
-#define CFG_OBJ_OUTER_DELIMS(c) (isspace(c) || c == ',' || c == ';')
-#define CFG_OBJ_INNER_DELIMS(c) (c == ':')
 static int
 cfg_objstring_parse(char *objstring, size_t objstring_sz, cfg_objlist_t *objlist, cfg_objtype_t objtype)
 {
@@ -480,7 +389,7 @@ cfg_objstring_parse(char *objstring, size_t objstring_sz, cfg_objlist_t *objlist
         /* take object */
         for (obj_e = obj_b; !CFG_OBJ_OUTER_DELIMS(objstring[obj_e]) && (obj_e < objstring_sz); obj_e++);
 
-        if (objtype == CFG_OBJ_ROOMMATES) {
+        if (objtype == CFG_OBJ_NME) {
             /* take object name */
             for (name_b = name_e = obj_b; !CFG_OBJ_INNER_DELIMS(objstring[name_e]) && (name_e < obj_e); name_e++);
             /* take object extension */
@@ -519,7 +428,7 @@ cfg_objlist_clear(cfg_objlist_t *objlist)
 }
 
 static int
-cfg_admin(char *cmdline, state_t *state, bool *quit)
+cfg_admline_parse(char *cmdline, state_t *state, bool *quit)
 {
     int   retcode = 0;
     char *cmdline_sptr = NULL;
@@ -537,14 +446,14 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
         *quit = false;
     }
 
-    if (state->is_admin) {
+    if (state->workmode == WORKMODE_CLIADM) {
         if (strcmp(command, ":roommates") == 0) {
             char *subcmd = strtok_r(NULL, " ", &cmdline_sptr);
 
             if (subcmd && (strcmp(subcmd, "add") == 0) && cmdline_sptr) {
                 cfg_objlist_t col_mates;
                 LIST_INIT(&col_mates);
-                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_NME);
 
                 if (!LIST_EMPTY(&col_mates)) {
                     roommates_add(&state->mates, &col_mates);
@@ -553,7 +462,7 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
             } else if (subcmd && (strcmp(subcmd, "del") == 0) && cmdline_sptr) {
                 cfg_objlist_t col_mates;
                 LIST_INIT(&col_mates);
-                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+                cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_NME);
 
                 if (!LIST_EMPTY(&col_mates)) {
                     roommates_del(&state->mates, &col_mates);
@@ -575,7 +484,7 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
                 if (rname && cmdline_sptr) {
                     cfg_objlist_t col_mates;
                     LIST_INIT(&col_mates);
-                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_NME);
 
                     if (!LIST_EMPTY(&col_mates)) {
                         room_add_mates(&state->rooms, &state->mates, rname, strlen(rname), &col_mates);
@@ -588,7 +497,7 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
                 if (rname && cmdline_sptr) {
                     cfg_objlist_t col_mates;
                     LIST_INIT(&col_mates);
-                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_ROOMMATES);
+                    cfg_objstring_parse(cmdline_sptr, strlen(cmdline_sptr), &col_mates, CFG_OBJ_NME);
 
                     if (!LIST_EMPTY(&col_mates)) {
                         room_del_mates(&state->rooms, rname, strlen(rname), &col_mates);
@@ -609,6 +518,212 @@ cfg_admin(char *cmdline, state_t *state, bool *quit)
     return retcode;
 }
 
+static int
+cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
+{
+    int   retcode = 0;
+    char *shortopts = "s:a:m:R:c:L:l:r:h";
+    struct option longopts[] = {
+            {"server",    required_argument, NULL, 's'},
+            {"admin",     required_argument, NULL, 'a'},
+            {"roommates", required_argument, NULL, 'm'},
+            {"rooms",     required_argument, NULL, 'R'},
+
+            {"connect",   required_argument, NULL, 'c'},
+            {"logadm",    required_argument, NULL, 'L'},
+            {"logmate",   required_argument, NULL, 'l'},
+            {"room",      required_argument, NULL, 'r'},
+
+            {"help",      no_argument,       NULL, 'h'},
+            {NULL,        0,                 NULL,  0}
+    };
+    struct valopts_s {
+        char    *server;
+        char    *admin;
+        char   **roommates;
+        size_t   roommates_cn;
+        size_t   roommates_sz;
+        char   **rooms;
+        size_t   rooms_cn;
+        size_t   rooms_sz;
+
+        char    *connect;
+        char    *logadm;
+        char    *logmate;
+        char    *room;
+
+        bool     help;
+    } valopts = {0};
+
+    int   opt;
+    while ((opt = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
+        switch(opt) {
+        case 's':
+            valopts.server = strdup(optarg);
+            break;
+        case 'a':
+            valopts.admin = strdup(optarg);
+            break;
+        case 'm':
+            valopts.roommates_sz = (valopts.roommates_sz == valopts.roommates_cn) ? valopts.roommates_sz * 2 + 1 : valopts.roommates_sz;
+            valopts.roommates = realloc(valopts.roommates, valopts.roommates_sz * sizeof(valopts.roommates[0]));
+            valopts.roommates[valopts.roommates_cn++] = optarg;
+            break;
+        case 'R':
+            valopts.rooms_sz = (valopts.rooms_sz == valopts.rooms_cn) ? valopts.rooms_sz * 2 + 1 : valopts.rooms_sz;
+            valopts.rooms = realloc(valopts.rooms, valopts.rooms_sz * sizeof(valopts.rooms[0]));
+            valopts.rooms[valopts.rooms_cn++] = optarg;
+            break;
+        case 'c':
+            valopts.connect = strdup(optarg);
+            break;
+        case 'L':
+            valopts.logadm = strdup(optarg);
+            break;
+        case 'l':
+            valopts.logmate = strdup(optarg);
+            break;
+        case 'r':
+            valopts.room = strdup(optarg);
+            break;
+        case 'h':
+            valopts.help = true;
+            break;
+        default:
+            printf("Unexpected option was found\n");
+        }
+    }
+    if (argc == 2 && valopts.help) {
+        printf("TODO: show help here\n");
+        *helpshow = 1;
+        goto finalize;
+    } else {
+        *helpshow = 0;
+    }
+
+    /* Validate Option Combinations */
+
+    if (!valopts.server && !valopts.connect) {
+        fprintf(stderr, "Either --server OR --connect option must be set\n");
+        retcode = -1;
+    } else if (valopts.server && valopts.connect) {
+        fprintf(stderr, "Can't set --server AND --connect options simultaneously\n");
+        retcode = -1;
+    }
+
+    if (!retcode && valopts.server && ( valopts.logadm || valopts.logmate || valopts.room)) {
+        fprintf(stderr, "Incorrect command line options combination\n");
+        retcode = -1;
+    }
+    if (!retcode && valopts.connect && (valopts.admin || valopts.roommates || valopts.rooms)) {
+        fprintf(stderr, "Incorrect command line options combination\n");
+        retcode = -1;
+    }
+
+    if (!retcode && valopts.server && !valopts.admin) {
+        fprintf(stderr, "--admin option must be set for server mode\n");
+        retcode = -1;
+    }
+    if (!retcode && valopts.connect && (!valopts.logadm && !valopts.logmate)) {
+        fprintf(stderr, "Either --logadm OR --logmate option must be set for client mode\n");
+        retcode = -1;
+    }
+    if (!retcode && valopts.connect && valopts.logadm && valopts.logmate) {
+        fprintf(stderr, "Can't set --logadm AND --logmate options simultaneously\n");
+        retcode = -1;
+    }
+
+    /* determine WORKMODE */
+    if (!retcode) {
+        if (valopts.server) {
+            state->workmode = WORKMODE_SRV;
+        } else if (valopts.logadm) {
+            state->workmode = WORKMODE_CLIADM;
+        } else if (valopts.logmate) {
+            state->workmode = WORKMODE_CLIMATE;
+        } else {
+            fprintf(stderr, "Unexpected command line parsing state\n");
+            retcode = -1;
+        }
+    }
+
+    cfg_objlist_t netpair_ol  = {0};
+    cfg_objlist_t credpair_ol = {0};
+    LIST_INIT(&netpair_ol);
+    LIST_INIT(&credpair_ol);
+
+    /* validate listen/connection address & port */
+    if (!retcode) {
+        char *netpair_s = valopts.server ? valopts.server : valopts.connect;
+        if ((cfg_objstring_parse(netpair_s, strlen(netpair_s), &netpair_ol, CFG_OBJ_NME) < 0)
+            || LIST_EMPTY(&netpair_ol)
+            || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->name_sz
+            || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext_sz
+           ) {
+            fprintf(stderr, "Unexpected value of --server/--connect option\n");
+            retcode = -1;
+            goto finalize;
+        }
+        char *host = ((cfg_obj_t *)LIST_FIRST(&netpair_ol))->name;
+        char *port = ((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext;
+        host[((cfg_obj_t *)LIST_FIRST(&netpair_ol))->name_sz] = '\0';
+
+        printf("Workmode: %u, host: %s, port: %s\n", state->workmode, host, port);
+        if (!inet_aton(host, &state->net_addr) || !(state->net_port = atoi(port))) {
+            fprintf(stderr, "Unexpected value of --server/--connect option\n");
+            retcode = -1;
+            goto finalize;
+        }
+    }
+
+    /* validate admin/logadm/logmate name & password */
+    if (!retcode) {
+        char *credpair_s = valopts.admin ? valopts.admin : (valopts.logadm ? valopts.logadm : valopts.logmate);
+
+        if ((cfg_objstring_parse(credpair_s, strlen(credpair_s), &credpair_ol, CFG_OBJ_NME) < 0)
+            || LIST_EMPTY(&credpair_ol)
+            || !((cfg_obj_t *)LIST_FIRST(&credpair_ol))->name_sz
+            || !((cfg_obj_t *)LIST_FIRST(&credpair_ol))->ext_sz
+           ) {
+            fprintf(stderr, "Unexpected value of --admin/--logadm/--logmate option\n");
+            retcode = -1;
+            goto finalize;
+        }
+        char *name = ((cfg_obj_t *)LIST_FIRST(&netpair_ol))->name;
+        char *pass = ((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext;
+        name[((cfg_obj_t *)LIST_FIRST(&netpair_ol))->name_sz] = '\0';
+
+        if (state->workmode == WORKMODE_SRV) {
+            state->adm_name = strdup(name);
+            state->adm_pass = strdup(pass);
+        } else if (state->workmode == WORKMODE_CLIADM) {
+            // :logadm name passwd
+        } else if (state->workmode == WORKMODE_CLIMATE) {
+            // :logmate name passwd
+        }
+    }
+
+    /* predefined mates */
+    if (!retcode && valopts.roommates) {
+        for (size_t i = 0; i < valopts.roommates_cn; i++) {
+            printf("roommates: %s\n", valopts.roommates[i]);
+        }
+    }
+
+    /* predefined rooms */
+    if (!retcode && valopts.rooms) {
+        for (size_t i = 0; i < valopts.rooms_cn; i++) {
+            printf("rooms: %s\n", valopts.rooms[i]);
+        }
+    }
+
+finalize:
+    cfg_objlist_clear(&netpair_ol);
+    cfg_objlist_clear(&credpair_ol);
+
+    return retcode;
+}
+
 int main(int argc, char **argv)
 {
 #if 0
@@ -623,14 +738,14 @@ int main(int argc, char **argv)
             line[strlen(line)-1] = '\0';
         }
         if (line) {
-            cfg_admin(line, &state, &fquit);
+            cfg_admline_parse(line, &state, &fquit);
         }
         free(line);
     }
     roommates_clear(&state.mates);
     rooms_clear(&state.rooms);
 #endif
-
+#if 0
     msg_broker_t broker = {0};
     CIRCLEQ_INIT(&broker.msg_pool);
     CIRCLEQ_INIT(&broker.msgs_local);
@@ -639,6 +754,11 @@ int main(int argc, char **argv)
     msg_add(&broker, MSG_TYP_CC, "!");
     msg_add(&broker, MSG_TYP_CC, "Hello, World!");
     msg_flush_local(&broker);
+    //getc
+#endif
+    state_t state = {0};
+    bool    helpshow = 0;
+    cfg_cmdline_parse(argc, argv, &state, &helpshow);
 
     return 0;
 }
