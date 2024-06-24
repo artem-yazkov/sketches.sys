@@ -14,35 +14,10 @@
 #include <netinet/in.h>
 #include <sys/queue.h>
 
-/***********************************
- * Room mates, Rooms & Connections
- ***********************************/
-typedef void roommates_t;
-typedef void rooms_t;
-typedef void conns_t;
-
-typedef struct roommate_s {
-    char        *name;
-    char        *passwd;
-    rooms_t     *rooms;
-    conns_t     *conns;
-} roommate_t;
-
-typedef struct room_s {
-    char        *name;
-    bool         is_open;
-    roommates_t *mates;
-    conns_t     *conns;
-} room_t;
-
-typedef struct conn_s {
-    roommate_t *roommate;
-    room_t     *room;
-} conn_t;
-
 /***********************
  * Message Broker
  ***********************/
+typedef struct conn_s conn_t;
 
 /* Message Types */
 #define MSG_TYP_CM      (0x1)   /* Chat Message, from Client to Client      */
@@ -62,7 +37,8 @@ typedef struct conn_s {
 #define MSG_WID_RMA     (0x5 << 4)  /* to all Room connections, including Active Connection */
 #define MSG_WID_MASK(X) (X & 0xF0)
 
-#define MSG_NOFIN       (0x1 << 8)  /* wait next part of the message */
+#define MSG_NOFIN       (0x1 << 8)  /* wait next part of the message    */
+#define MSG_DISCONNECT  (0x2 << 8)  /* disconnect when sent the message */
 
 typedef struct msg_s {
     char   *data;
@@ -75,17 +51,53 @@ typedef struct msg_s {
 typedef CIRCLEQ_HEAD(msg_list_s, msg_s) msg_list_t;
 
 typedef struct msg_broker_s {
-    conn_t *active_conn;
-    msg_list_t msg_pool;
-    msg_list_t msgs_local;
+    conn_t    *active_conn;
+    msg_list_t ml_pool;
+    msg_list_t ml_local;
 } msg_broker_t;
 
 static void
 msg_set_active_conn(msg_broker_t *broker, conn_t *conn);
+static void
+msg_set_global_broker(msg_broker_t *broker);
 static int
 msg_add(msg_broker_t *broker, int options, const char * format, ... );
 static void
 msg_flush_local(msg_broker_t *broker);
+
+/***********************************
+ * Room mates, Rooms & Connections
+ ***********************************/
+typedef void roommates_t;
+typedef void rooms_t;
+typedef void conns_t;
+
+typedef struct admin_s {
+    char        *passwd;
+    conns_t     *conns;
+} admin_t;
+
+typedef struct roommate_s {
+    char        *name;
+    char        *passwd;
+    rooms_t     *rooms;
+    conns_t     *conns;
+} roommate_t;
+
+typedef struct room_s {
+    char        *name;
+    bool         is_open;
+    roommates_t *mates;
+    conns_t     *conns;
+} room_t;
+
+typedef struct conn_s {
+    bool        is_adm;
+    roommate_t *roommate;
+    room_t     *room;
+    msg_list_t *ml_outg;
+    size_t      cursor_outg;
+} conn_t;
 
 /***************************
  * State of the process
@@ -101,27 +113,30 @@ typedef struct state_s {
     workmode_t      workmode;
     struct in_addr  net_addr;
     int             net_port;
-    char           *adm_name;
-    char           *adm_pass;
     msg_broker_t    msg_broker;
 
+    admin_t         admin;
     roommates_t    *mates;
     rooms_t        *rooms;
     conns_t        *conns;
 } state_t;
+static int
+state_init(state_t *state);
+static void
+state_free(state_t *state);
 
 /**************************************
  * configure with admin line parser
  * configure with command line options
  **************************************/
 typedef enum cfg_objtype_e {
-    CFG_OBJ_NM,
-    CFG_OBJ_NME
+    CFG_OBJ_V,
+    CFG_OBJ_VE
 } cfg_objtype_t;
 
 typedef struct cfg_obj_s {
-    char   *name;
-    size_t  name_sz;
+    char   *val;
+    size_t  val_sz;
     char   *ext;
     size_t  ext_sz;
     LIST_ENTRY(cfg_obj_s) lentry;
@@ -132,6 +147,8 @@ typedef LIST_HEAD(cfg_objlist_s, cfg_obj_s) cfg_objlist_t;
 #define CFG_OBJ_INNER_DELIMS(c) (c == ':')
 static int
 cfg_objstring_parse(char *objstring, size_t objstring_sz, cfg_objlist_t *objlist, cfg_objtype_t objtype);
+static int
+cfg_objlist_clear(cfg_objlist_t *objlist);
 static int
 cfg_admline_parse(char *cmdline, state_t *state, bool *quit);
 static int
