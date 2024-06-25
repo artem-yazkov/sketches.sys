@@ -50,10 +50,16 @@ typedef struct msg_s {
 } msg_t;
 typedef CIRCLEQ_HEAD(msg_list_s, msg_s) msg_list_t;
 
+typedef struct msgp_s {
+    msg_t *msg;
+    CIRCLEQ_ENTRY(msgp_s) cq_entry;
+} msgp_t;
+typedef CIRCLEQ_HEAD(msgp_list_s, msgp_s) msgp_list_t;
+
 typedef struct msg_broker_s {
-    conn_t    *active_conn;
-    msg_list_t ml_pool;
-    msg_list_t ml_local;
+    conn_t     *active_conn;
+    msg_list_t  ml_pool;
+    msgp_list_t mpl_local;
 } msg_broker_t;
 
 static void
@@ -62,6 +68,8 @@ static void
 msg_set_global_broker(msg_broker_t *broker);
 static int
 msg_add(msg_broker_t *broker, int options, const char * format, ... );
+static void
+msg_dump(msg_broker_t *broker);
 static void
 msg_flush_local(msg_broker_t *broker);
 
@@ -120,10 +128,22 @@ typedef struct state_s {
     rooms_t        *rooms;
     conns_t        *conns;
 } state_t;
+
 static int
 state_init(state_t *state);
 static void
 state_free(state_t *state);
+
+static void
+state_status_mates_wlk_short(const void *ptr, VISIT order, void *ctx);
+static void
+state_status_mates_wlk_long(const void *ptr, VISIT order, void *ctx);
+static void
+state_status_rooms_wlk_short(const void *ptr, VISIT order, void *ctx);
+static void
+state_status_rooms_wlk_long(const void *ptr, VISIT order, void *ctx);
+static void
+state_status_take(state_t *state, int msg_opts);
 
 /**************************************
  * configure with admin line parser

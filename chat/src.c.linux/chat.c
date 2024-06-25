@@ -25,7 +25,8 @@ msg_add(msg_broker_t *broker, int options, const char * format, ... )
     broker = broker ? broker : global_broker;
 
     /* add new message to the list, or update data on last message */
-    msg_t *msg = NULL;
+    msg_t  *msg  = NULL;
+    msgp_t *msgp = NULL;
     if (CIRCLEQ_EMPTY(&broker->ml_pool) || CIRCLEQ_LAST(&broker->ml_pool)->ready) {
         msg = calloc(1, sizeof(msg_t));
         if (!(msg = calloc(1, sizeof(msg_t)))) {
@@ -54,17 +55,28 @@ msg_add(msg_broker_t *broker, int options, const char * format, ... )
 
     msg->options = options;
     if (!(msg->options & MSG_NOFIN)) {
+        while (msg->data_sz && msg->data[msg->data_sz-1] == '\n') {
+            msg->data[msg->data_sz-1] = '\0';
+            msg->data_sz--;
+        }
         msg->ready = 1;
         /* create appropriate references */
         if (!broker->active_conn ||
             (MSG_TYP_MASK(msg->options) == MSG_TYP_LE) || (MSG_TYP_MASK(msg->options) == MSG_TYP_LI)
             ) {
-            CIRCLEQ_INSERT_TAIL(&broker->ml_local, msg, cq_entry);
+            msgp = calloc(1, sizeof(msgp_t));
+            msgp->msg = msg;
+            CIRCLEQ_INSERT_TAIL(&broker->mpl_local, msgp, cq_entry);
         }
     }
     return 0;
 
 error:
+
+    if (msgp) {
+        CIRCLEQ_REMOVE(&broker->mpl_local, msgp, cq_entry);
+        free(msgp);
+    }
     if (msg) {
         CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
         free(msg->data);
@@ -83,15 +95,26 @@ error:
 }
 
 static void
+msg_dump(msg_broker_t *broker)
+{
+    msg_t *msg;
+    CIRCLEQ_FOREACH(msg, &broker->ml_pool, cq_entry) {
+        printf("%s%s\n", strchr(msg->data, '\n') ? "...\n" : ".  ", msg->data);
+    }
+}
+
+static void
 msg_flush_local(msg_broker_t *broker)
 {
     broker = broker ? broker : global_broker;
-    msg_t *mfirst = CIRCLEQ_FIRST(&broker->ml_local);
-    for (; mfirst != (void *)&broker->ml_local; ) {
-        fprintf(stderr, "  '%.*s'\n", (int)mfirst->data_sz, mfirst->data);
-        msg_t *mnext = CIRCLEQ_NEXT(mfirst, cq_entry);
-        free(mfirst);
-        mfirst = mnext;
+    while (!CIRCLEQ_EMPTY(&broker->mpl_local)) {
+        msgp_t *msgp = CIRCLEQ_FIRST(&broker->mpl_local);
+        fprintf(stderr, "%s%s\n", strchr(msgp->msg->data, '\n') ? "...\n" : ".  ", msgp->msg->data);
+        CIRCLEQ_REMOVE(&broker->ml_pool, msgp->msg, cq_entry);
+        CIRCLEQ_REMOVE(&broker->mpl_local, msgp, cq_entry);
+        free(msgp->msg->data);
+        free(msgp->msg);
+        free(msgp);
     }
 }
 
@@ -108,42 +131,6 @@ static int
 rooms_compar(const void *mate_l, const void *mate_r)
 {
     return strcmp(((room_t *)mate_l)->name, ((room_t *)mate_r)->name);
-}
-
-/***********************
- * status routines
- ***********************/
-typedef enum status_verbosity_e {
-    STATUS_VERBOSITY_SHORT,
-    STATUS_VERBOSITY_LONG
-} status_verbosity_t;
-
-static void
-roommates_status(const void *ptr, VISIT order, void *ctx)
-{
-    if (order == postorder || order == leaf) {
-        roommate_t *mate = *(roommate_t **) ptr;
-        if ((uint64_t)ctx == STATUS_VERBOSITY_SHORT) {
-            printf("%s  ", mate->name);
-        } else {
-            printf("  * %s (%s)\n", mate->name, mate->passwd);
-        }
-    }
-}
-
-static void
-rooms_status(const void *ptr, VISIT order, void *ctx)
-{
-    if (order == postorder || order == leaf) {
-        room_t *room = *(room_t **) ptr;
-        if ((uint64_t)ctx == STATUS_VERBOSITY_SHORT) {
-            printf("%s  ", room->name);
-        } else {
-            printf("  * name: %s, open: %s, mates:  ", room->name, room->is_open ? "yes" : "no");
-            twalk_r(room->mates, roommates_status, (void *)STATUS_VERBOSITY_SHORT);
-            printf("\n");
-        }
-    }
 }
 
 /***********************
@@ -395,11 +382,14 @@ rooms_clear(rooms_t **rooms)
     return 0;
 }
 
+/**************************
+ * State of the process
+ **************************/
 static int
 state_init(state_t *state)
 {
     CIRCLEQ_INIT(&state->msg_broker.ml_pool);
-    CIRCLEQ_INIT(&state->msg_broker.ml_local);
+    CIRCLEQ_INIT(&state->msg_broker.mpl_local);
     return 0;
 }
 
@@ -409,9 +399,61 @@ state_free(state_t *state)
     return;
 }
 
-/**************************
- * configuration handling
- **************************/
+static void
+state_status_mates_wlk_short(const void *ptr, VISIT order, void *ctx)
+{
+    if (order == postorder || order == leaf) {
+        roommate_t *mate = *(roommate_t **) ptr;
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", mate->name);
+    }
+}
+static void
+state_status_mates_wlk_long(const void *ptr, VISIT order, void *ctx)
+{
+    if (order == postorder || order == leaf) {
+        roommate_t *mate = *(roommate_t **) ptr;
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, passwd: %s\n", mate->name, mate->passwd);
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    rooms: ");
+        twalk_r(mate->rooms, state_status_rooms_wlk_short, ctx);
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
+    }
+}
+static void
+state_status_rooms_wlk_short(const void *ptr, VISIT order, void *ctx)
+{
+    if (order == postorder || order == leaf) {
+        room_t *room = *(room_t **) ptr;
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", room->name);
+    }
+}
+static void
+state_status_rooms_wlk_long(const void *ptr, VISIT order, void *ctx)
+{
+    if (order == postorder || order == leaf) {
+        room_t *room = *(room_t **) ptr;
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, open: %s\n", room->name, room->is_open ? "yes" : "no");
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    roommates: ");
+        twalk_r(room->mates, state_status_mates_wlk_short, ctx);
+        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
+    }
+}
+
+static void
+state_status_take(state_t *state, int msg_opts)
+{
+    msg_add(NULL, msg_opts | MSG_NOFIN, "preset roommates: \n");
+    twalk_r(state->mates, state_status_mates_wlk_long, &msg_opts);
+    msg_add(NULL, msg_opts | MSG_NOFIN, "\n");
+
+    msg_add(NULL, msg_opts | MSG_NOFIN, "preset rooms: \n");
+    twalk_r(state->rooms, state_status_rooms_wlk_long, &msg_opts);
+    msg_add(NULL, msg_opts, "");
+}
+
+/**************************************
+ * configure with admin line parser
+ * configure with command line options
+ **************************************/
 static int
 cfg_objstring_parse(char *objstring, size_t objstring_sz, cfg_objlist_t *objlist, cfg_objtype_t objtype)
 {
@@ -507,7 +549,7 @@ cfg_admline_parse(char *cmdline, state_t *state, bool *quit)
                 roommates_clear(&state->mates);
 
             } else if (subcmd && strcmp(subcmd, "show") == 0) {
-                twalk_r(state->mates, roommates_status, (void *)STATUS_VERBOSITY_LONG);
+                // TODO: show status here
             }
         }
 
@@ -543,10 +585,7 @@ cfg_admline_parse(char *cmdline, state_t *state, bool *quit)
         }
 
         if (strcmp(command, ":status") == 0) {
-            printf("Room Mates status:\n");
-            twalk_r(state->mates, roommates_status, (void *)STATUS_VERBOSITY_LONG);
-            printf("Rooms status:\n");
-            twalk_r(state->rooms, rooms_status, (void *)STATUS_VERBOSITY_LONG);
+            // TODO: show status here
         }
     }
     free(cmdline_sdup);
@@ -722,7 +761,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             retcode = -1;
             goto finalize;
         }
-        cfg_obj_t *cobj = (cfg_obj_t *)LIST_FIRST(&netpair_ol);
+        cfg_obj_t *cobj = (cfg_obj_t *)LIST_FIRST(&credpair_ol);
         char      *name, *pass;
         if (valopts.logmate) {
             name = cobj->val;
@@ -730,7 +769,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             name[cobj->val_sz] = '\0';
         } else {
             name = NULL;
-            pass = name = cobj->val;
+            pass = cobj->val;
         }
 
         if (state->workmode == WORKMODE_SRV) {
@@ -847,13 +886,20 @@ int main(int argc, char **argv)
     parsecode = cfg_cmdline_parse(argc, argv, &state, &helpshow);
     printf("helpshow: %i\n", helpshow);
     if (parsecode == 0) {
+        char saddr[INET_ADDRSTRLEN] = {0};
         printf("workmode: %s\n",
                 (state.workmode == WORKMODE_SRV ? "WORKMODE_SRV" : (state.workmode == WORKMODE_CLIADM ? "WORKMODE_CLIADM" : "WORKMODE_CLIMATE")));
-        //state.net_addr
-        //state.net_port
-
+        printf("netpoint: %s:%d\n", inet_ntop(AF_INET, &state.net_addr, saddr, sizeof(saddr)), state.net_port);
+        if (state.workmode == WORKMODE_SRV) {
+            printf("admin.passwd: %s\n", state.admin.passwd);
+            state_status_take(&state, MSG_TYP_LI);
+            msg_flush_local(&state.msg_broker);
+        } else {
+            printf("message broker:\n");
+            msg_dump(&state.msg_broker);
+        }
     } else {
-        msg_flush_local(NULL);
+        msg_flush_local(&state.msg_broker);
         printf("Do the next command to show available commands:\n\t %s --help\n", argv[0]);
     }
     state_free(&state);
