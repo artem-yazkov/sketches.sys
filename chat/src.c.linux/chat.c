@@ -20,7 +20,13 @@ msg_set_global_broker(msg_broker_t *broker)
 }
 
 static int
-msg_add(msg_broker_t *broker, int options, const char * format, ... )
+msg_add_data(msg_broker_t *broker, uint16_t options, void *data, size_t size)
+{
+    return 0;
+}
+
+static int
+msg_add(msg_broker_t *broker, uint16_t options, const char * format, ... )
 {
     broker = broker ? broker : global_broker;
 
@@ -53,8 +59,12 @@ msg_add(msg_broker_t *broker, int options, const char * format, ... )
     va_end(args);
     msg->data_sz += chunk_sz;
 
-    msg->options = options;
-    if (!(msg->options & MSG_NOFIN)) {
+    if (msg->data_sz > UINT16_MAX) {
+        goto error;
+    }
+    msg->hdr.len = (uint16_t)msg->data_sz;
+    msg->hdr.ops = options;
+    if (!(msg->hdr.ops & MSG_NOFIN)) {
         while (msg->data_sz && msg->data[msg->data_sz-1] == '\n') {
             msg->data[msg->data_sz-1] = '\0';
             msg->data_sz--;
@@ -62,7 +72,7 @@ msg_add(msg_broker_t *broker, int options, const char * format, ... )
         msg->ready = 1;
         /* create appropriate references */
         if (!broker->active_conn ||
-            (MSG_TYP_MASK(msg->options) == MSG_TYP_LE) || (MSG_TYP_MASK(msg->options) == MSG_TYP_LI)
+            (MSG_TYP_MASK(msg->hdr.ops) == MSG_TYP_LE) || (MSG_TYP_MASK(msg->hdr.ops) == MSG_TYP_LI)
             ) {
             msgp = calloc(1, sizeof(msgp_t));
             msgp->msg = msg;
@@ -92,6 +102,72 @@ error:
         fprintf(stderr, "\n");
     }
     return -1;
+}
+
+static int
+msg_fd_read(int fd, msg_t *msg, size_t *cursor)
+{
+    char  *buffer;
+    size_t expected;
+
+    if (*cursor < sizeof(msg->hdr)) {
+        buffer = (char *)&msg->hdr + *cursor;
+        expected = sizeof(msg->hdr) - *cursor;
+    } else {
+        if (msg->data_sz < msg->hdr.len) {
+            msg->data_sz = msg->hdr.len;
+            msg->data = realloc(msg->data, msg->data_sz);
+            if (!msg->data) {
+                errno = ENOMEM;
+                return MSG_IO_ERR;
+            }
+        }
+        buffer = msg->data + *cursor - sizeof(msg->hdr);
+        expected = msg->hdr.len - (*cursor - sizeof(msg->hdr));
+    }
+
+    int rc = recv(fd, buffer, expected, 0);
+    *cursor += (rc > 0 ? rc : 0);
+
+    if (rc < expected) {
+        return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+    }
+    if (*cursor == sizeof(msg->hdr)) {
+        rc = msg_fd_read(fd, msg, cursor);
+        if (rc < expected) {
+            return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+        }
+    }
+    return MSG_IO_OK;
+}
+
+static int
+msg_fd_write(int fd, msg_t *msg, size_t *cursor)
+{
+    char  *buffer;
+    size_t expected;
+
+    if (*cursor < sizeof(msg->hdr)) {
+        buffer = (char *)&msg->hdr + *cursor;
+        expected = sizeof(msg->hdr) - *cursor;
+    } {
+        buffer = msg->data + *cursor - sizeof(msg->hdr);
+        expected = msg->hdr.len - (*cursor - sizeof(msg->hdr));
+    }
+
+    int rc = send(fd, buffer, expected, 0);
+    *cursor += (rc > 0 ? rc : 0);
+
+    if (rc < expected) {
+        return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+    }
+    if (*cursor == sizeof(msg->hdr)) {
+        rc = msg_fd_write(fd, msg, cursor);
+        if (rc < expected) {
+            return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+        }
+    }
+    return MSG_IO_OK;
 }
 
 static void
@@ -183,7 +259,8 @@ roommates_add(roommates_t **mates, cfg_objlist_t *cfgmates)
     cfg_obj_t *cmate;
     LIST_FOREACH(cmate, cfgmates, lentry) {
         if (!cmate->val_sz || !cmate->ext_sz) {
-            msg_add(NULL, MSG_TYP_LE,
+            msg_add(
+                    NULL, MSG_TYP_LE,
                     "Room Mate name and password must be set. Ignore object '%.*s:%.*s'",
                     (int)(cmate->val_sz), cmate->val,
                     (int)(cmate->ext_sz), cmate->ext);
@@ -388,6 +465,7 @@ rooms_clear(rooms_t **rooms)
 static int
 state_init(state_t *state)
 {
+    *state = (state_t){0};
     CIRCLEQ_INIT(&state->msg_broker.ml_pool);
     CIRCLEQ_INIT(&state->msg_broker.mpl_local);
     return 0;
@@ -448,6 +526,28 @@ state_status_take(state_t *state, int msg_opts)
     msg_add(NULL, msg_opts | MSG_NOFIN, "preset rooms: \n");
     twalk_r(state->rooms, state_status_rooms_wlk_long, &msg_opts);
     msg_add(NULL, msg_opts, "");
+}
+
+/**************************
+ * Network communication
+ **************************/
+static int
+cli_loop(state_t *state)
+{
+    int c;
+    // read(fileno(stdin), &c, 1);
+    // printf("characted is: %c\n", c);
+    // STDIN_FILENO
+    while((c=getchar())!= 'e') {
+        putchar(c);
+    }
+    return 0;
+}
+
+static int
+srv_loop(state_t *state)
+{
+    return 0;
 }
 
 /**************************************
@@ -847,36 +947,6 @@ finalize:
 int main(int argc, char **argv)
 {
 #if 0
-    state_t state = {.is_admin = true};
-    bool fquit = false;
-
-    while(!fquit) {
-        char  *line = NULL;
-        size_t line_sz = 0;
-        getline(&line, &line_sz, stdin);
-        while (line && strlen(line) && line[strlen(line)-1] == '\n') {
-            line[strlen(line)-1] = '\0';
-        }
-        if (line) {
-            cfg_admline_parse(line, &state, &fquit);
-        }
-        free(line);
-    }
-    roommates_clear(&state.mates);
-    rooms_clear(&state.rooms);
-#endif
-#if 0
-    msg_broker_t broker = {0};
-    CIRCLEQ_INIT(&broker.ml_pool);
-    CIRCLEQ_INIT(&broker.ml_local);
-    msg_add(&broker, MSG_TYP_CC | MSG_NOFIN, "Hello");
-    msg_add(&broker, MSG_TYP_CC | MSG_NOFIN, ", World");
-    msg_add(&broker, MSG_TYP_CC, "!");
-    msg_add(&broker, MSG_TYP_CC, "Hello, World!");
-    msg_flush_local(&broker);
-    //getc
-#endif
-
     state_t state = {0};
     bool    helpshow = 0;
     int    parsecode = 0;
@@ -905,4 +975,11 @@ int main(int argc, char **argv)
     state_free(&state);
 
     return parsecode < 0 ? 1 : 0;
+#endif
+
+    state_t state;
+    state_init(&state);
+
+    cli_loop(&state);
+    return 0;
 }

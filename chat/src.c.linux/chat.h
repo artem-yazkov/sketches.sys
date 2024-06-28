@@ -1,6 +1,7 @@
 #ifndef _CHAT_H
 
 #include <ctype.h>
+#include <errno.h>
 #include <getopt.h>
 #include <search.h>
 #include <stdarg.h>
@@ -9,9 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/queue.h>
 
 /***********************
@@ -41,9 +45,12 @@ typedef struct conn_s conn_t;
 #define MSG_DISCONNECT  (0x2 << 8)  /* disconnect when sent the message */
 
 typedef struct msg_s {
+    struct  msg_hdr_s {
+        uint16_t ops;
+        uint16_t len;
+    } hdr;
     char   *data;
     size_t  data_sz;
-    int     options;
     bool    ready;
     int     refs;
     CIRCLEQ_ENTRY(msg_s) cq_entry;
@@ -62,14 +69,25 @@ typedef struct msg_broker_s {
     msgp_list_t mpl_local;
 } msg_broker_t;
 
+#define MSG_IO_AGAIN  ( 1)
+#define MSG_IO_DOWN   (-2)
+#define MSG_IO_ERR    (-1)
+#define MSG_IO_OK     ( 0)
+
 static void
 msg_set_active_conn(msg_broker_t *broker, conn_t *conn);
 static void
 msg_set_global_broker(msg_broker_t *broker);
 static int
-msg_add(msg_broker_t *broker, int options, const char * format, ... );
+msg_add_data(msg_broker_t *broker, uint16_t options, void *data, size_t size);
+static int
+msg_add(msg_broker_t *broker, uint16_t options, const char * format, ... );
+static int
+msg_fd_read(int fd, msg_t *msg, size_t *cursor);
+static int
+msg_fd_write(int fd, msg_t *msg, size_t *cursor);
 static void
-msg_dump(msg_broker_t *broker);
+msg_dump_local(msg_broker_t *broker);
 static void
 msg_flush_local(msg_broker_t *broker);
 
@@ -144,6 +162,14 @@ static void
 state_status_rooms_wlk_long(const void *ptr, VISIT order, void *ctx);
 static void
 state_status_take(state_t *state, int msg_opts);
+
+/**************************
+ * Network communication
+ **************************/
+static int
+cli_loop(state_t *state);
+static int
+srv_loop(state_t *state);
 
 /**************************************
  * configure with admin line parser
