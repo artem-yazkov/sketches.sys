@@ -4,108 +4,68 @@
  * Message Broker
  ***********************************************/
 
-msg_broker_t *global_broker;
-
-static void
-msg_set_active_conn(msg_broker_t *broker, conn_t *conn)
-{
-    broker = broker ? broker : global_broker;
-    broker->active_conn = conn;
-}
-
-static void
-msg_set_global_broker(msg_broker_t *broker)
-{
-    global_broker = broker;
-}
-
 static int
-msg_add_data(msg_broker_t *broker, uint16_t options, void *data, size_t size)
+msg_add_bin(msg_t *msg, char *data, size_t size)
 {
+    if (!msg) {
+        return -1;
+    }
+    uint16_t cursor = msg->hdr.len;
+    msg->hdr.len += (size + msg->hdr.len > UINT16_MAX) ? UINT16_MAX : ((uint16_t)size + msg->hdr.len);
+    if (msg->data_sz < msg->hdr.len) {
+        msg->data_sz = msg->hdr.len;
+        msg->data = realloc(msg->data, msg->data_sz);
+    }
+    if (msg->data_sz && !msg->data) {
+        goto error;
+    }
+    memcpy(&msg->data[cursor], data, msg->hdr.len - cursor);
+
     return 0;
-}
-
-static int
-msg_add(msg_broker_t *broker, uint16_t options, const char * format, ... )
-{
-    broker = broker ? broker : global_broker;
-
-    /* add new message to the list, or update data on last message */
-    msg_t  *msg  = NULL;
-    msgp_t *msgp = NULL;
-    if (CIRCLEQ_EMPTY(&broker->ml_pool) || CIRCLEQ_LAST(&broker->ml_pool)->ready) {
-        msg = calloc(1, sizeof(msg_t));
-        if (!(msg = calloc(1, sizeof(msg_t)))) {
-            goto error;
-        }
-        CIRCLEQ_INSERT_TAIL(&broker->ml_pool, msg, cq_entry);
-    } else {
-        msg = CIRCLEQ_LAST(&broker->ml_pool);
-    }
-    va_list args;
-    va_start(args, format);
-    char *chunk = NULL;
-    int   chunk_sz = vsnprintf (NULL, 0, format, args);
-    va_end(args);
-    if (chunk_sz < 0) {
-        goto error;
-    }
-    if (!(chunk = realloc(msg->data, msg->data_sz + chunk_sz + 1))) {
-        goto error;
-    }
-    msg->data = chunk;
-    va_start(args, format);
-    vsnprintf (&msg->data[msg->data_sz], chunk_sz + 1, format, args);
-    va_end(args);
-    msg->data_sz += chunk_sz;
-
-    if (msg->data_sz > UINT16_MAX) {
-        goto error;
-    }
-    msg->hdr.len = (uint16_t)msg->data_sz;
-    msg->hdr.ops = options;
-    if (!(msg->hdr.ops & MSG_NOFIN)) {
-        while (msg->data_sz && msg->data[msg->data_sz-1] == '\n') {
-            msg->data[msg->data_sz-1] = '\0';
-            msg->data_sz--;
-        }
-        msg->ready = 1;
-        /* create appropriate references */
-        if (!broker->active_conn ||
-            (MSG_TYP_MASK(msg->hdr.ops) == MSG_TYP_LE) || (MSG_TYP_MASK(msg->hdr.ops) == MSG_TYP_LI)
-            ) {
-            msgp = calloc(1, sizeof(msgp_t));
-            msgp->msg = msg;
-            CIRCLEQ_INSERT_TAIL(&broker->mpl_local, msgp, cq_entry);
-        }
-    }
-    return 0;
-
 error:
-
-    if (msgp) {
-        CIRCLEQ_REMOVE(&broker->mpl_local, msgp, cq_entry);
-        free(msgp);
-    }
-    if (msg) {
-        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
-        free(msg->data);
-        free(msg);
-    }
-    {
-        fprintf(stderr, "can't handle the message: ");
-        va_list args;
-        va_start(args, format);
-        char *chunk = NULL;
-        int   chunk_sz = vfprintf (stderr, format, args);
-        va_end(args);
-        fprintf(stderr, "\n");
-    }
+    free(msg->data);
+    memset(msg, 0, sizeof(*msg));
     return -1;
 }
 
 static int
-msg_fd_read(int fd, msg_t *msg, size_t *cursor)
+msg_add_fmt(msg_t *msg, const char * format, ...)
+{
+    if (!msg) {
+        return -1;
+    }
+    va_list args;
+    va_start(args, format);
+    int   size = vsnprintf (NULL, 0, format, args);
+    va_end(args);
+    if (size < 0) {
+        goto error;
+    }
+
+    uint16_t cursor = msg->hdr.len;
+    msg->hdr.len += (size + msg->hdr.len > UINT16_MAX) ? UINT16_MAX : ((uint16_t)size + msg->hdr.len);
+    if (msg->data_sz < msg->hdr.len) {
+        msg->data_sz = msg->hdr.len;
+        msg->data = realloc(msg->data, msg->data_sz);
+    }
+    if (msg->data_sz && !msg->data) {
+        goto error;
+    }
+
+    va_start(args, format);
+    size = vsnprintf (&msg->data[cursor], msg->hdr.len - cursor, format, args);
+    va_end(args);
+
+    return 0;
+
+error:
+    free(msg->data);
+    memset(msg, 0, sizeof(*msg));
+    return -1;
+}
+
+static int
+msg_io_read(msg_t *msg, int fd, size_t *cursor)
 {
     char  *buffer;
     size_t expected;
@@ -130,19 +90,19 @@ msg_fd_read(int fd, msg_t *msg, size_t *cursor)
     *cursor += (rc > 0 ? rc : 0);
 
     if (rc < expected) {
-        return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+        return (rc == -1) ? MSG_IO_ERR : ( (rc == 0) ? MSG_IO_DOWN : MSG_IO_AGAIN);
     }
     if (*cursor == sizeof(msg->hdr)) {
-        rc = msg_fd_read(fd, msg, cursor);
+        rc = msg_io_read(msg, fd, cursor);
         if (rc < expected) {
-            return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+            return (rc == -1) ? MSG_IO_ERR : ( (rc == 0) ? MSG_IO_DOWN : MSG_IO_AGAIN);
         }
     }
     return MSG_IO_OK;
 }
 
 static int
-msg_fd_write(int fd, msg_t *msg, size_t *cursor)
+msg_io_write(msg_t *msg, int fd, size_t *cursor)
 {
     char  *buffer;
     size_t expected;
@@ -150,7 +110,7 @@ msg_fd_write(int fd, msg_t *msg, size_t *cursor)
     if (*cursor < sizeof(msg->hdr)) {
         buffer = (char *)&msg->hdr + *cursor;
         expected = sizeof(msg->hdr) - *cursor;
-    } {
+    } else  {
         buffer = msg->data + *cursor - sizeof(msg->hdr);
         expected = msg->hdr.len - (*cursor - sizeof(msg->hdr));
     }
@@ -159,30 +119,62 @@ msg_fd_write(int fd, msg_t *msg, size_t *cursor)
     *cursor += (rc > 0 ? rc : 0);
 
     if (rc < expected) {
-        return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+        return (rc == -1) ? MSG_IO_ERR : ( (rc == 0) ? MSG_IO_DOWN : MSG_IO_AGAIN);
     }
     if (*cursor == sizeof(msg->hdr)) {
-        rc = msg_fd_write(fd, msg, cursor);
+        rc = msg_io_write(msg, fd, cursor);
         if (rc < expected) {
-            return rc == -1 ? MSG_IO_ERR : ( 0 ? MSG_IO_DOWN : MSG_IO_AGAIN);
+            return (rc == -1) ? MSG_IO_ERR : ( (rc == 0) ? MSG_IO_DOWN : MSG_IO_AGAIN);
         }
     }
     return MSG_IO_OK;
 }
 
-static void
-msg_dump(msg_broker_t *broker)
+static int
+mbr_add_loginfo(msg_broker_t *broker, const char * format, ...)
 {
-    msg_t *msg;
-    CIRCLEQ_FOREACH(msg, &broker->ml_pool, cq_entry) {
-        printf("%s%s\n", strchr(msg->data, '\n') ? "...\n" : ".  ", msg->data);
+    msg_t  *msg  = mbr_grow(broker, MSG_TYP_LI | MSG_COMMIT, NULL);
+    if (!msg) {
+        return -1;
+    }
+
+error:
+    if (msg) {
+        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
+        free(msg->data);
+        free(msg);
     }
 }
 
-static void
-msg_flush_local(msg_broker_t *broker)
+static msg_t *
+mbr_grow(msg_broker_t *broker, uint16_t options, conn_t *conn)
 {
-    broker = broker ? broker : global_broker;
+    msg_t  *msg  = NULL;
+
+    if (CIRCLEQ_EMPTY(&broker->ml_pool) || CIRCLEQ_LAST(&broker->ml_pool)->commit) {
+        if (!(msg = calloc(1, sizeof(msg_t)))) {
+            goto error;
+        }
+        CIRCLEQ_INSERT_TAIL(&broker->ml_pool, msg, cq_entry);
+    } else {
+        msg = CIRCLEQ_LAST(&broker->ml_pool);
+    }
+    msg->hdr.ops = options;
+    msg->commit = options & MSG_COMMIT;
+    return msg;
+
+error:
+    if (msg) {
+        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
+        free(msg->data);
+        free(msg);
+    }
+    return NULL;
+}
+
+static void
+mbr_flush_locals(msg_broker_t *broker)
+{
     while (!CIRCLEQ_EMPTY(&broker->mpl_local)) {
         msgp_t *msgp = CIRCLEQ_FIRST(&broker->mpl_local);
         fprintf(stderr, "%s%s\n", strchr(msgp->msg->data, '\n') ? "...\n" : ".  ", msgp->msg->data);
@@ -191,6 +183,14 @@ msg_flush_local(msg_broker_t *broker)
         free(msgp->msg->data);
         free(msgp->msg);
         free(msgp);
+    }
+}
+
+static void
+mbr_clean(msg_broker_t *broker)
+{
+    msg_t *msg;
+    CIRCLEQ_FOREACH(msg, &broker->ml_pool, cq_entry) {
     }
 }
 
@@ -259,11 +259,11 @@ roommates_add(roommates_t **mates, cfg_objlist_t *cfgmates)
     cfg_obj_t *cmate;
     LIST_FOREACH(cmate, cfgmates, lentry) {
         if (!cmate->val_sz || !cmate->ext_sz) {
-            msg_add(
-                    NULL, MSG_TYP_LE,
-                    "Room Mate name and password must be set. Ignore object '%.*s:%.*s'",
-                    (int)(cmate->val_sz), cmate->val,
-                    (int)(cmate->ext_sz), cmate->ext);
+//            msg_add(
+//                    NULL, MSG_TYP_LE,
+//                    "Room Mate name and password must be set. Ignore object '%.*s:%.*s'",
+//                    (int)(cmate->val_sz), cmate->val,
+//                    (int)(cmate->ext_sz), cmate->ext);
             continue;
         }
         roommate_t *roommate;
@@ -274,7 +274,7 @@ roommates_add(roommates_t **mates, cfg_objlist_t *cfgmates)
                 roommate_del(roommate);
                 return -1;
             } else if (*(roommate_t **)pmate != roommate) {
-                msg_add(NULL, MSG_TYP_LE,  "Room Mate %s exists. Can't create new one with same name");
+//                msg_add(NULL, MSG_TYP_LE,  "Room Mate %s exists. Can't create new one with same name");
                 roommate_del(roommate);
             }
         }
@@ -353,7 +353,7 @@ room_add_mates(rooms_t **rooms, roommates_t **mates, char *room_name, size_t roo
 {
     room_t *room;
     if (room_create(&room, room_name, room_name_sz) < 0) {
-        msg_add(NULL, MSG_TYP_LE, "can't create new room '%.*s'", (int)room_name_sz, room_name);
+//        msg_add(NULL, MSG_TYP_LE, "can't create new room '%.*s'", (int)room_name_sz, room_name);
         return -1;
     }
     void *proom = tsearch(room, rooms, rooms_compar);
@@ -481,51 +481,51 @@ static void
 state_status_mates_wlk_short(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
-        roommate_t *mate = *(roommate_t **) ptr;
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", mate->name);
+//        roommate_t *mate = *(roommate_t **) ptr;
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", mate->name);
     }
 }
 static void
 state_status_mates_wlk_long(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
-        roommate_t *mate = *(roommate_t **) ptr;
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, passwd: %s\n", mate->name, mate->passwd);
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    rooms: ");
-        twalk_r(mate->rooms, state_status_rooms_wlk_short, ctx);
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
+//        roommate_t *mate = *(roommate_t **) ptr;
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, passwd: %s\n", mate->name, mate->passwd);
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    rooms: ");
+//        twalk_r(mate->rooms, state_status_rooms_wlk_short, ctx);
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
     }
 }
 static void
 state_status_rooms_wlk_short(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
-        room_t *room = *(room_t **) ptr;
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", room->name);
+//        room_t *room = *(room_t **) ptr;
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "%s  ", room->name);
     }
 }
 static void
 state_status_rooms_wlk_long(const void *ptr, VISIT order, void *ctx)
 {
     if (order == postorder || order == leaf) {
-        room_t *room = *(room_t **) ptr;
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, open: %s\n", room->name, room->is_open ? "yes" : "no");
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    roommates: ");
-        twalk_r(room->mates, state_status_mates_wlk_short, ctx);
-        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
+//        room_t *room = *(room_t **) ptr;
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "  * name: %s, open: %s\n", room->name, room->is_open ? "yes" : "no");
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "    roommates: ");
+//        twalk_r(room->mates, state_status_mates_wlk_short, ctx);
+//        msg_add(NULL, *(int *)ctx | MSG_NOFIN, "\n");
     }
 }
 
 static void
 state_status_take(state_t *state, int msg_opts)
 {
-    msg_add(NULL, msg_opts | MSG_NOFIN, "preset roommates: \n");
+//    msg_add(NULL, msg_opts | MSG_NOFIN, "preset roommates: \n");
     twalk_r(state->mates, state_status_mates_wlk_long, &msg_opts);
-    msg_add(NULL, msg_opts | MSG_NOFIN, "\n");
+//    msg_add(NULL, msg_opts | MSG_NOFIN, "\n");
 
-    msg_add(NULL, msg_opts | MSG_NOFIN, "preset rooms: \n");
+//    msg_add(NULL, msg_opts | MSG_NOFIN, "preset rooms: \n");
     twalk_r(state->rooms, state_status_rooms_wlk_long, &msg_opts);
-    msg_add(NULL, msg_opts, "");
+//    msg_add(NULL, msg_opts, "");
 }
 
 /**************************
@@ -764,7 +764,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             valopts.help = true;
             break;
         default:
-            msg_add(NULL, MSG_TYP_LE, "unexpected option was found");
+//            msg_add(NULL, MSG_TYP_LE, "unexpected option was found");
         }
     }
     if (argc == 2 && valopts.help) {
@@ -777,32 +777,32 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
     /* Validate Option Combinations */
 
     if (!valopts.server && !valopts.connect) {
-        msg_add(NULL, MSG_TYP_LE, "either --server OR --connect option must be set");
+//        msg_add(NULL, MSG_TYP_LE, "either --server OR --connect option must be set");
         retcode = -1;
     } else if (valopts.server && valopts.connect) {
-        msg_add(NULL, MSG_TYP_LE, "can't set --server AND --connect options simultaneously");
+//        msg_add(NULL, MSG_TYP_LE, "can't set --server AND --connect options simultaneously");
         retcode = -1;
     }
 
     if (!retcode && valopts.server && ( valopts.logadm || valopts.logmate || valopts.room)) {
-        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
+//        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
         retcode = -1;
     }
     if (!retcode && valopts.connect && (valopts.admin || valopts.roommates || valopts.rooms)) {
-        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
+//        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
         retcode = -1;
     }
 
     if (!retcode && valopts.server && !valopts.admin) {
-        msg_add(NULL, MSG_TYP_LE, "--admin option must be set for server mode");
+//        msg_add(NULL, MSG_TYP_LE, "--admin option must be set for server mode");
         retcode = -1;
     }
     if (!retcode && valopts.connect && (!valopts.logadm && !valopts.logmate)) {
-        msg_add(NULL, MSG_TYP_LE, "either --logadm OR --logmate option must be set for client mode");
+//        msg_add(NULL, MSG_TYP_LE, "either --logadm OR --logmate option must be set for client mode");
         retcode = -1;
     }
     if (!retcode && valopts.connect && valopts.logadm && valopts.logmate) {
-        msg_add(NULL, MSG_TYP_LE, "can't set --logadm AND --logmate options simultaneously");
+//        msg_add(NULL, MSG_TYP_LE, "can't set --logadm AND --logmate options simultaneously");
         retcode = -1;
     }
 
@@ -815,7 +815,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
         } else if (valopts.logmate) {
             state->workmode = WORKMODE_CLIMATE;
         } else {
-            msg_add(NULL, MSG_TYP_LE, "unexpected command line parsing state");
+//            msg_add(NULL, MSG_TYP_LE, "unexpected command line parsing state");
             retcode = -1;
         }
     }
@@ -833,7 +833,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->val_sz
             || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext_sz
            ) {
-            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
+//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
             retcode = -1;
             goto finalize;
         }
@@ -842,7 +842,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
         host[((cfg_obj_t *)LIST_FIRST(&netpair_ol))->val_sz] = '\0';
 
         if (!inet_aton(host, &state->net_addr) || !(state->net_port = atoi(port))) {
-            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
+//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
             retcode = -1;
             goto finalize;
         }
@@ -857,7 +857,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             || (!((cfg_obj_t *)LIST_FIRST(&credpair_ol))->val_sz)
             || (!((cfg_obj_t *)LIST_FIRST(&credpair_ol))->ext_sz && valopts.logmate)
            ) {
-            msg_add(NULL, MSG_TYP_LE, "unexpected value of --admin/--logadm/--logmate option");
+//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --admin/--logadm/--logmate option");
             retcode = -1;
             goto finalize;
         }
@@ -875,15 +875,15 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
         if (state->workmode == WORKMODE_SRV) {
             state->admin.passwd = strdup(pass);
         } else if (state->workmode == WORKMODE_CLIADM) {
-            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logadm %s", pass);
+//            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logadm %s", pass);
         } else if (state->workmode == WORKMODE_CLIMATE) {
-            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logmate %s %s", name, pass);
+//            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logmate %s %s", name, pass);
         }
     }
 
     /* predefined room */
     if (!retcode && valopts.room) {
-        retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":enter %s", valopts.room);
+//        retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":enter %s", valopts.room);
     }
 
     /* predefined mates */

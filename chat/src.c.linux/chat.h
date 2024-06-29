@@ -41,8 +41,8 @@ typedef struct conn_s conn_t;
 #define MSG_WID_RMA     (0x5 << 4)  /* to all Room connections, including Active Connection */
 #define MSG_WID_MASK(X) (X & 0xF0)
 
-#define MSG_NOFIN       (0x1 << 8)  /* wait next part of the message    */
-#define MSG_DISCONNECT  (0x2 << 8)  /* disconnect when sent the message */
+#define MSG_COMMIT      (0x1 << 8)  /*    */
+#define MSG_NET_FIN     (0x2 << 8)  /* disconnect client when sent the message */
 
 typedef struct msg_s {
     struct  msg_hdr_s {
@@ -51,7 +51,7 @@ typedef struct msg_s {
     } hdr;
     char   *data;
     size_t  data_sz;
-    bool    ready;
+    bool    commit;
     int     refs;
     CIRCLEQ_ENTRY(msg_s) cq_entry;
 } msg_t;
@@ -64,7 +64,6 @@ typedef struct msgp_s {
 typedef CIRCLEQ_HEAD(msgp_list_s, msgp_s) msgp_list_t;
 
 typedef struct msg_broker_s {
-    conn_t     *active_conn;
     msg_list_t  ml_pool;
     msgp_list_t mpl_local;
 } msg_broker_t;
@@ -74,22 +73,25 @@ typedef struct msg_broker_s {
 #define MSG_IO_ERR    (-1)
 #define MSG_IO_OK     ( 0)
 
-static void
-msg_set_active_conn(msg_broker_t *broker, conn_t *conn);
-static void
-msg_set_global_broker(msg_broker_t *broker);
 static int
-msg_add_data(msg_broker_t *broker, uint16_t options, void *data, size_t size);
+msg_add_bin(msg_t *msg, char *data, size_t size);
 static int
-msg_add(msg_broker_t *broker, uint16_t options, const char * format, ... );
+msg_add_fmt(msg_t *msg, const char * format, ...);
 static int
-msg_fd_read(int fd, msg_t *msg, size_t *cursor);
+msg_io_read(msg_t *msg, int fd, size_t *cursor);
 static int
-msg_fd_write(int fd, msg_t *msg, size_t *cursor);
+msg_io_write(msg_t *msg, int fd, size_t *cursor);
+
+static int
+mbr_add_loginfo(msg_broker_t *broker, const char * format, ...);
+static int
+mbr_add_logerr(msg_broker_t *broker, const char * format, ...);
+static msg_t *
+mbr_grow(msg_broker_t *broker, uint16_t options, conn_t *conn);
 static void
-msg_dump_local(msg_broker_t *broker);
+mbr_flush_locals(msg_broker_t *broker);
 static void
-msg_flush_local(msg_broker_t *broker);
+mbr_clean(msg_broker_t *broker);
 
 /***********************************
  * Room mates, Rooms & Connections
@@ -118,11 +120,11 @@ typedef struct room_s {
 } room_t;
 
 typedef struct conn_s {
-    bool        is_adm;
-    roommate_t *roommate;
-    room_t     *room;
-    msg_list_t *ml_outg;
-    size_t      cursor_outg;
+    bool         is_adm;
+    roommate_t  *roommate;
+    room_t      *room;
+    msgp_list_t  mpl_out;
+    size_t       cursor_out;
 } conn_t;
 
 /***************************
