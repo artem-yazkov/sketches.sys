@@ -78,6 +78,9 @@ msg_add_bin(msg_t *msg, char *data, size_t size);
 static int
 msg_add_fmt(msg_t *msg, const char * format, ...);
 static int
+msg_add_va(msg_t *msg, const char * format, va_list args);
+
+static int
 msg_io_read(msg_t *msg, int fd, size_t *cursor);
 static int
 msg_io_write(msg_t *msg, int fd, size_t *cursor);
@@ -86,6 +89,7 @@ static int
 mbr_add_loginfo(msg_broker_t *broker, const char * format, ...);
 static int
 mbr_add_logerr(msg_broker_t *broker, const char * format, ...);
+
 static msg_t *
 mbr_grow(msg_broker_t *broker, uint16_t options, conn_t *conn);
 static void

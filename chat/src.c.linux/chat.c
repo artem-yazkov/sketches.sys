@@ -31,13 +31,21 @@ error:
 static int
 msg_add_fmt(msg_t *msg, const char * format, ...)
 {
+    va_list args;
+    va_start(args, format);
+    int rc = msg_add_va(msg, format, args);
+    va_end(args);
+
+    return rc;
+}
+
+static int
+msg_add_va(msg_t *msg, const char * format, va_list args)
+{
     if (!msg) {
         return -1;
     }
-    va_list args;
-    va_start(args, format);
-    int   size = vsnprintf (NULL, 0, format, args);
-    va_end(args);
+    int size = vsnprintf (NULL, 0, format, args);
     if (size < 0) {
         goto error;
     }
@@ -52,10 +60,7 @@ msg_add_fmt(msg_t *msg, const char * format, ...)
         goto error;
     }
 
-    va_start(args, format);
-    size = vsnprintf (&msg->data[cursor], msg->hdr.len - cursor, format, args);
-    va_end(args);
-
+    vsnprintf (&msg->data[cursor], msg->hdr.len - cursor, format, args);
     return 0;
 
 error:
@@ -137,6 +142,32 @@ mbr_add_loginfo(msg_broker_t *broker, const char * format, ...)
     if (!msg) {
         return -1;
     }
+
+    va_list args;
+    va_start(args, format);
+    int rc = msg_add_va(msg, format, args);
+    va_end(args);
+
+error:
+    if (msg) {
+        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
+        free(msg->data);
+        free(msg);
+    }
+}
+
+static int
+mbr_add_logerr(msg_broker_t *broker, const char * format, ...)
+{
+    msg_t  *msg  = mbr_grow(broker, MSG_TYP_LE | MSG_COMMIT, NULL);
+    if (!msg) {
+        return -1;
+    }
+
+    va_list args;
+    va_start(args, format);
+    int rc = msg_add_va(msg, format, args);
+    va_end(args);
 
 error:
     if (msg) {
