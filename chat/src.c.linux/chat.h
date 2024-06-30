@@ -2,8 +2,10 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <search.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,6 +16,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/queue.h>
@@ -86,9 +89,9 @@ static int
 msg_io_write(msg_t *msg, int fd, size_t *cursor);
 
 static int
-mbr_add_loginfo(msg_broker_t *broker, const char * format, ...);
+mbr_add_logi(msg_broker_t *broker, const char * format, ...);
 static int
-mbr_add_logerr(msg_broker_t *broker, const char * format, ...);
+mbr_add_loge(msg_broker_t *broker, const char * format, ...);
 
 static msg_t *
 mbr_grow(msg_broker_t *broker, uint16_t options, conn_t *conn);
@@ -124,11 +127,18 @@ typedef struct room_s {
 } room_t;
 
 typedef struct conn_s {
-    bool         is_adm;
-    roommate_t  *roommate;
-    room_t      *room;
-    msgp_list_t  mpl_out;
-    size_t       cursor_out;
+    int                 fd;
+    struct sockaddr_in  addr;
+    socklen_t           addr_len;
+
+    bool                is_adm;
+    roommate_t         *roommate;
+    room_t             *room;
+
+    msg_t               msg_in;
+    size_t              cursor_in;
+    msgp_list_t         mpl_out;
+    size_t              cursor_out;
 } conn_t;
 
 /***************************
@@ -136,8 +146,8 @@ typedef struct conn_s {
  ***************************/
 typedef enum workmode_s {
     WORKMODE_SRV,
-    WORKMODE_CLIADM,
-    WORKMODE_CLIMATE
+    WORKMODE_ADM,
+    WORKMODE_MATE
 } workmode_t;
 #define WORKMODE_CLI(MODE) ((MODE == WORKMODE_CLIADM) || (MODE == WORKMODE_CLIMATE))
 
@@ -145,9 +155,9 @@ typedef struct state_s {
     workmode_t      workmode;
     struct in_addr  net_addr;
     int             net_port;
-    msg_broker_t    msg_broker;
-
     admin_t         admin;
+    msg_broker_t    mbroker;
+
     roommates_t    *mates;
     rooms_t        *rooms;
     conns_t        *conns;

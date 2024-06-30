@@ -136,7 +136,7 @@ msg_io_write(msg_t *msg, int fd, size_t *cursor)
 }
 
 static int
-mbr_add_loginfo(msg_broker_t *broker, const char * format, ...)
+mbr_add_logi(msg_broker_t *broker, const char * format, ...)
 {
     msg_t  *msg  = mbr_grow(broker, MSG_TYP_LI | MSG_COMMIT, NULL);
     if (!msg) {
@@ -148,16 +148,11 @@ mbr_add_loginfo(msg_broker_t *broker, const char * format, ...)
     int rc = msg_add_va(msg, format, args);
     va_end(args);
 
-error:
-    if (msg) {
-        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
-        free(msg->data);
-        free(msg);
-    }
+    return 0;
 }
 
 static int
-mbr_add_logerr(msg_broker_t *broker, const char * format, ...)
+mbr_add_loge(msg_broker_t *broker, const char * format, ...)
 {
     msg_t  *msg  = mbr_grow(broker, MSG_TYP_LE | MSG_COMMIT, NULL);
     if (!msg) {
@@ -169,12 +164,10 @@ mbr_add_logerr(msg_broker_t *broker, const char * format, ...)
     int rc = msg_add_va(msg, format, args);
     va_end(args);
 
-error:
-    if (msg) {
-        CIRCLEQ_REMOVE(&broker->ml_pool, msg, cq_entry);
-        free(msg->data);
-        free(msg);
+    if (errno != 0) {
+        msg_add_fmt(msg, " (%d: %s)", errno, strerror(errno));
     }
+    return 0;
 }
 
 static msg_t *
@@ -192,6 +185,15 @@ mbr_grow(msg_broker_t *broker, uint16_t options, conn_t *conn)
     }
     msg->hdr.ops = options;
     msg->commit = options & MSG_COMMIT;
+
+    if (msg->commit && (options & (MSG_TYP_LI | MSG_TYP_LE) )) {
+        msgp_t *msgp = calloc(1, sizeof(msgp_t));
+        if (msgp) {
+            msgp->msg = msg;
+            CIRCLEQ_INSERT_TAIL(&broker->mpl_local, msgp, cq_entry);
+        }
+    }
+
     return msg;
 
 error:
@@ -208,7 +210,10 @@ mbr_flush_locals(msg_broker_t *broker)
 {
     while (!CIRCLEQ_EMPTY(&broker->mpl_local)) {
         msgp_t *msgp = CIRCLEQ_FIRST(&broker->mpl_local);
-        fprintf(stderr, "%s%s\n", strchr(msgp->msg->data, '\n') ? "...\n" : ".  ", msgp->msg->data);
+        char *sf_long = msgp->msg->hdr.ops & MSG_TYP_LE ? "EEE\n" : "iii\n";
+        char *sf_shrt = msgp->msg->hdr.ops & MSG_TYP_LE ? "E  "   : "i  ";
+
+        fprintf(stderr, "%s%s\n", strchr(msgp->msg->data, '\n') ? sf_long : sf_shrt, msgp->msg->data);
         CIRCLEQ_REMOVE(&broker->ml_pool, msgp->msg, cq_entry);
         CIRCLEQ_REMOVE(&broker->mpl_local, msgp, cq_entry);
         free(msgp->msg->data);
@@ -235,9 +240,21 @@ roommates_compar(const void *mate_l, const void *mate_r)
 }
 
 static int
-rooms_compar(const void *mate_l, const void *mate_r)
+rooms_compar(const void *room_l, const void *room_r)
 {
-    return strcmp(((room_t *)mate_l)->name, ((room_t *)mate_r)->name);
+    return strcmp(((room_t *)room_l)->name, ((room_t *)room_r)->name);
+}
+
+static int
+conns_compar(const void *conn_l, const void *conn_r)
+{
+    if (((conn_t *)conn_l)->fd > ((conn_t *)conn_r)->fd) {
+        return 1;
+    } else if (((conn_t *)conn_l)->fd < ((conn_t *)conn_r)->fd) {
+        return -1;
+    } else {
+        return 0;
+    }
 }
 
 /***********************
@@ -497,8 +514,8 @@ static int
 state_init(state_t *state)
 {
     *state = (state_t){0};
-    CIRCLEQ_INIT(&state->msg_broker.ml_pool);
-    CIRCLEQ_INIT(&state->msg_broker.mpl_local);
+    CIRCLEQ_INIT(&state->mbroker.ml_pool);
+    CIRCLEQ_INIT(&state->mbroker.mpl_local);
     return 0;
 }
 
@@ -562,6 +579,14 @@ state_status_take(state_t *state, int msg_opts)
 /**************************
  * Network communication
  **************************/
+
+int  signal_quit_flag;
+
+void signal_quit_handler(int signum)
+{
+    signal_quit_flag = signum;
+}
+
 static int
 cli_loop(state_t *state)
 {
@@ -578,6 +603,122 @@ cli_loop(state_t *state)
 static int
 srv_loop(state_t *state)
 {
+    struct sigaction sigact;
+    sigact.sa_handler = signal_quit_handler;
+    sigemptyset(&sigact.sa_mask);
+    sigact.sa_flags = 0;
+
+    sigaction(SIGHUP,  &sigact, NULL);
+    sigaction(SIGINT,  &sigact, NULL);
+    sigaction(SIGTERM, &sigact, NULL);
+
+    /*
+     * configure listening socket
+     */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        mbr_add_loge(&state->mbroker, "can't create listen socket");
+        return -1;
+    }
+    int sockopt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt));
+
+    struct sockaddr_in listen_addr = {0};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_port = state->net_port;
+    listen_addr.sin_addr = state->net_addr;
+
+    if (bind(listen_fd, (struct sockaddr *)(&listen_addr), sizeof(listen_addr)) < 0) {
+        mbr_add_loge(
+                &state->mbroker, "can't bind listen socket to %s:%d",
+                inet_ntoa(listen_addr.sin_addr),
+                ntohs(listen_addr.sin_port));
+        close(listen_fd);
+        return -1;
+    }
+    if (listen(listen_fd, INT32_MAX) < 0) {
+        mbr_add_loge(&state->mbroker, "listen socket error");
+        close(listen_fd);
+        return -1;
+    }
+
+    /*
+     * configure event poll
+     */
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        mbr_add_loge(&state->mbroker, "epoll instance creation error");
+        close(listen_fd);
+        return -1;
+    }
+    const  int         EPEV_WPOOL = 16;
+    struct epoll_event epev_wpool[EPEV_WPOOL];
+    struct epoll_event epev_ctl;
+
+    epev_ctl.data.ptr = NULL;
+    epev_ctl.events   = EPOLLIN;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &epev_ctl) < 0) {
+        mbr_add_loge(&state->mbroker, "can't add listen socket to epoll");
+        close(epoll_fd);
+        close(listen_fd);
+        return -1;
+    }
+
+    for (;;) {
+        int epev_cnt = epoll_wait(epoll_fd, epev_wpool, EPEV_WPOOL, -1);
+        if (epev_cnt < 0) {
+            mbr_add_loge(&state->mbroker, "epoll_wait error");
+            break;
+        }
+        if (signal_quit_flag) {
+            mbr_add_loge(&state->mbroker, "interrupted by %d signal", signal_quit_flag);
+            break;
+        }
+
+        for (int iev = 0; iev < epev_cnt; iev++) {
+            if (epev_wpool[iev].data.ptr == NULL) {
+                /* got input event from the listen_fd. Establish new connection */
+                conn_t *conn = calloc(1, sizeof(conn_t));
+                if (!conn) {
+                    mbr_add_loge(&state->mbroker, "can't create new client connection");
+                    continue;
+                }
+                conn->fd = accept(listen_fd, (struct sockaddr *)&conn->addr, &conn->addr_len);
+                if (conn->fd < 0) {
+                    mbr_add_loge(&state->mbroker, "can't accept new client connection");
+                    free(conn);
+                    continue;
+                }
+                fcntl(conn->fd, F_SETFL, O_NONBLOCK);
+                epev_ctl.data.ptr = conn;
+                epev_ctl.events   = EPOLLIN;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->fd, &epev_ctl) < 0) {
+                    fprintf(stderr, "can't add client socket to epoll");
+                    close(conn->fd);
+                    free(conn);
+                    continue;
+                }
+                conn_t *pconn = tsearch(conn, &state->conns, conns_compar);
+                if (!pconn || (*(conn_t **)pconn != conn)) {
+                    fprintf(stderr, "can't add new connection to the state tree");
+                    close(conn->fd);
+                    free(conn);
+                    continue;
+                }
+
+            } else if (epev_wpool[iev].events & EPOLLIN) {
+                /* input event from the client connection */
+                conn_t *conn = epev_wpool[iev].data.ptr;
+                msg_io_read(&conn->msg_in, conn->fd, &conn->cursor_in);
+                msg_io_write(&conn->msg_in, conn->fd, &conn->cursor_out);
+            }
+        }
+    }
+
+    close(epoll_fd);
+    close(listen_fd);
+
     return 0;
 }
 
@@ -654,7 +795,7 @@ cfg_admline_parse(char *cmdline, state_t *state, bool *quit)
         *quit = false;
     }
 
-    if (state->workmode == WORKMODE_CLIADM) {
+    if (state->workmode == WORKMODE_ADM) {
         if (strcmp(command, ":roommates") == 0) {
             char *subcmd = strtok_r(NULL, " ", &cmdline_sptr);
 
@@ -795,7 +936,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             valopts.help = true;
             break;
         default:
-//            msg_add(NULL, MSG_TYP_LE, "unexpected option was found");
+            mbr_add_loge(&state->mbroker, "unexpected option was found");
         }
     }
     if (argc == 2 && valopts.help) {
@@ -808,32 +949,32 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
     /* Validate Option Combinations */
 
     if (!valopts.server && !valopts.connect) {
-//        msg_add(NULL, MSG_TYP_LE, "either --server OR --connect option must be set");
+        mbr_add_loge(&state->mbroker, "either --server OR --connect option must be set");
         retcode = -1;
     } else if (valopts.server && valopts.connect) {
-//        msg_add(NULL, MSG_TYP_LE, "can't set --server AND --connect options simultaneously");
+        mbr_add_loge(&state->mbroker, "can't set --server AND --connect options simultaneously");
         retcode = -1;
     }
 
     if (!retcode && valopts.server && ( valopts.logadm || valopts.logmate || valopts.room)) {
-//        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
+        mbr_add_loge(&state->mbroker, "incorrect command line options combination");
         retcode = -1;
     }
     if (!retcode && valopts.connect && (valopts.admin || valopts.roommates || valopts.rooms)) {
-//        msg_add(NULL, MSG_TYP_LE, "incorrect command line options combination");
+        mbr_add_loge(&state->mbroker, "incorrect command line options combination");
         retcode = -1;
     }
 
     if (!retcode && valopts.server && !valopts.admin) {
-//        msg_add(NULL, MSG_TYP_LE, "--admin option must be set for server mode");
+        mbr_add_loge(&state->mbroker, "--admin option must be set for server mode");
         retcode = -1;
     }
     if (!retcode && valopts.connect && (!valopts.logadm && !valopts.logmate)) {
-//        msg_add(NULL, MSG_TYP_LE, "either --logadm OR --logmate option must be set for client mode");
+        mbr_add_loge(&state->mbroker, "either --logadm OR --logmate option must be set for client mode");
         retcode = -1;
     }
     if (!retcode && valopts.connect && valopts.logadm && valopts.logmate) {
-//        msg_add(NULL, MSG_TYP_LE, "can't set --logadm AND --logmate options simultaneously");
+        mbr_add_loge(&state->mbroker, "can't set --logadm AND --logmate options simultaneously");
         retcode = -1;
     }
 
@@ -842,11 +983,11 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
         if (valopts.server) {
             state->workmode = WORKMODE_SRV;
         } else if (valopts.logadm) {
-            state->workmode = WORKMODE_CLIADM;
+            state->workmode = WORKMODE_ADM;
         } else if (valopts.logmate) {
-            state->workmode = WORKMODE_CLIMATE;
+            state->workmode = WORKMODE_MATE;
         } else {
-//            msg_add(NULL, MSG_TYP_LE, "unexpected command line parsing state");
+            mbr_add_loge(&state->mbroker, "unexpected command line parsing state");
             retcode = -1;
         }
     }
@@ -864,7 +1005,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->val_sz
             || !((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext_sz
            ) {
-//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
+            mbr_add_loge(&state->mbroker, "unexpected value of --server/--connect option");
             retcode = -1;
             goto finalize;
         }
@@ -872,11 +1013,12 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
         char *port = ((cfg_obj_t *)LIST_FIRST(&netpair_ol))->ext;
         host[((cfg_obj_t *)LIST_FIRST(&netpair_ol))->val_sz] = '\0';
 
-        if (!inet_aton(host, &state->net_addr) || !(state->net_port = atoi(port))) {
-//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --server/--connect option");
+        if (!inet_aton(host, &state->net_addr) || (atoi(port) <= 0) || (atoi(port) > UINT16_MAX)) {
+            mbr_add_loge(&state->mbroker, "unexpected value of --server/--connect option");
             retcode = -1;
             goto finalize;
         }
+        state->net_port = htons((uint16_t)atoi(port));
     }
 
     /* validate admin/logadm/logmate name & password */
@@ -888,7 +1030,7 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
             || (!((cfg_obj_t *)LIST_FIRST(&credpair_ol))->val_sz)
             || (!((cfg_obj_t *)LIST_FIRST(&credpair_ol))->ext_sz && valopts.logmate)
            ) {
-//            msg_add(NULL, MSG_TYP_LE, "unexpected value of --admin/--logadm/--logmate option");
+            mbr_add_loge(&state->mbroker, "unexpected value of --admin/--logadm/--logmate option");
             retcode = -1;
             goto finalize;
         }
@@ -905,9 +1047,9 @@ cfg_cmdline_parse(int argc, char **argv, state_t *state, bool *helpshow)
 
         if (state->workmode == WORKMODE_SRV) {
             state->admin.passwd = strdup(pass);
-        } else if (state->workmode == WORKMODE_CLIADM) {
+        } else if (state->workmode == WORKMODE_ADM) {
 //            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logadm %s", pass);
-        } else if (state->workmode == WORKMODE_CLIMATE) {
+        } else if (state->workmode == WORKMODE_MATE) {
 //            retcode = msg_add(&state->msg_broker, MSG_TYP_CC, ":logmate %s %s", name, pass);
         }
     }
@@ -982,7 +1124,7 @@ int main(int argc, char **argv)
     bool    helpshow = 0;
     int    parsecode = 0;
     state_init(&state);
-    msg_set_global_broker(&state.msg_broker);
+    msg_set_global_broker(&state.mbroker);
 
     parsecode = cfg_cmdline_parse(argc, argv, &state, &helpshow);
     printf("helpshow: %i\n", helpshow);
@@ -994,13 +1136,13 @@ int main(int argc, char **argv)
         if (state.workmode == WORKMODE_SRV) {
             printf("admin.passwd: %s\n", state.admin.passwd);
             state_status_take(&state, MSG_TYP_LI);
-            msg_flush_local(&state.msg_broker);
+            msg_flush_local(&state.mbroker);
         } else {
             printf("message broker:\n");
-            msg_dump(&state.msg_broker);
+            msg_dump(&state.mbroker);
         }
     } else {
-        msg_flush_local(&state.msg_broker);
+        msg_flush_local(&state.mbroker);
         printf("Do the next command to show available commands:\n\t %s --help\n", argv[0]);
     }
     state_free(&state);
@@ -1011,6 +1153,13 @@ int main(int argc, char **argv)
     state_t state;
     state_init(&state);
 
-    cli_loop(&state);
+    bool helpshow = false;
+    if (cfg_cmdline_parse(argc, argv, &state, &helpshow) < 0) {
+        mbr_flush_locals(&state.mbroker);
+    }
+
+    srv_loop(&state);
+
+    state_free(&state);
     return 0;
 }
